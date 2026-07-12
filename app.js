@@ -60,7 +60,7 @@ function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add
 const LEER = {
   mitglieder: [], termine: [], stundenplan: {}, todos: [], routinen: [],
   einkauf: [], einkaufHistorie: {}, kochbuch: [], essensplan: {}, packlisten: [],
-  kinderaufgaben: [], sterne: {}, zettel: [], countdowns: [],
+  kinderaufgaben: [], sterne: {}, taschengeld: {}, zettel: [], countdowns: [],
   ideen: [], geschenke: [], gesundheit: [], notfall: [],
   einstellungen: { pin: "2468" }
 };
@@ -88,6 +88,7 @@ function starte() {
   }
   firebase.initializeApp(FIREBASE_CONFIG);
   db = firebase.database();
+  try { firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(() => {}); } catch (e) {}
   firebase.auth().onAuthStateChanged(user => {
     if (user) {
       meinName = (user.email || "").split("@")[0];
@@ -105,18 +106,44 @@ function starte() {
           if (!Array.isArray(S[k])) S[k] = S[k] ? Object.values(S[k]) : [];
         }
         render();
+        if (!window.__gcalGeladen && S.einstellungen && S.einstellungen.icsUrl) {
+          window.__gcalGeladen = true; ladeGcal(false);
+        }
+        if (!window.__kioskGestartet && kioskAktiv() && kinder().length) {
+          window.__kioskGestartet = true;
+          const ich = mitglied(ichId());
+          kidsKind = (ich && ich.rolle === "kind") ? ich.id : (kinder().length === 1 ? kinder()[0].id : null);
+          $("kids").classList.add("open"); renderKids();
+        } else if (!window.__ichGefragt && S.mitglieder.length && !mitglied(ichId())) {
+          window.__ichGefragt = true; ichFragen();
+        }
       });
     } else {
-      $("login").classList.add("open");
+      // Auto-Login mit gemerkten Zugangsdaten (einmaliger Versuch)
+      const cred = gespeicherteCred();
+      if (cred && !window.__autoLoginVersucht) {
+        window.__autoLoginVersucht = true;
+        firebase.auth().signInWithEmailAndPassword(cred.m, cred.p)
+          .catch(() => { credLoeschen(); $("login").classList.add("open"); });
+      } else {
+        $("login").classList.add("open");
+      }
     }
   });
 }
+function gespeicherteCred() {
+  try { const raw = localStorage.getItem("whanau-cred"); return raw ? JSON.parse(atob(raw)) : null; } catch (e) { return null; }
+}
+function credMerken(m, p) { try { localStorage.setItem("whanau-cred", btoa(JSON.stringify({ m, p }))); } catch (e) {} }
+function credLoeschen() { try { localStorage.removeItem("whanau-cred"); } catch (e) {} }
 function doLogin() {
   $("lg-err").textContent = "";
-  firebase.auth().signInWithEmailAndPassword($("lg-mail").value.trim(), $("lg-pass").value)
+  const m = $("lg-mail").value.trim(), p = $("lg-pass").value;
+  firebase.auth().signInWithEmailAndPassword(m, p)
+    .then(() => { const box = $("lg-merken"); if (!box || box.checked) credMerken(m, p); else credLoeschen(); })
     .catch(e => { $("lg-err").textContent = "Anmeldung fehlgeschlagen – E-Mail/Passwort prüfen."; });
 }
-function doLogout() { if (confirm("Abmelden?")) firebase.auth().signOut(); }
+function doLogout() { if (confirm("Abmelden?")) { credLoeschen(); firebase.auth().signOut(); } }
 function save(...keys) { keys.forEach(k => db.ref("daten/" + k).set(S[k])); }
 
 /* ---------- Navigation ---------- */
@@ -144,12 +171,104 @@ function segHtml(bereich, optionen) {
     `<button class="${sub[bereich] === o[0] ? "on" : ""}" onclick="setSub('${bereich}','${o[0]}')">${o[1]}</button>`).join("") + `</div>`;
 }
 
+/* ---------- Google-Kalender (ICS, nur lesen) ---------- */
+let gcal = { events: [], status: "aus", am: null };
+function icsEntfalten(text) {
+  // Zeilen entfalten (Fortsetzungszeilen beginnen mit Leerzeichen/Tab)
+  return text.replace(/\r\n/g, "\n").replace(/\n[ \t]/g, "");
+}
+function icsDatum(wert, params) {
+  // 20260712 oder 20260712T140000(Z)
+  const m = wert.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z?))?/);
+  if (!m) return null;
+  if (!m[4]) return { datum: m[1] + "-" + m[2] + "-" + m[3], zeit: "", ganztags: true };
+  if (m[7] === "Z") {
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+    return { datum: dstr(d), zeit: String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"), ganztags: false };
+  }
+  return { datum: m[1] + "-" + m[2] + "-" + m[3], zeit: m[4] + ":" + m[5], ganztags: false };
+}
+function parseICS(text, vonDs, bisDs) {
+  const events = [];
+  const bloecke = icsEntfalten(text).split("BEGIN:VEVENT").slice(1);
+  const RRTAGE = { MO: "Mo", TU: "Di", WE: "Mi", TH: "Do", FR: "Fr", SA: "Sa", SU: "So" };
+  for (const b of bloecke) {
+    const teil = b.split("END:VEVENT")[0];
+    const feld = name => {
+      const m = teil.match(new RegExp("^" + name + "(;[^:]*)?:(.*)$", "m"));
+      return m ? { wert: m[2].trim(), params: m[1] || "" } : null;
+    };
+    const st = feld("DTSTART"); if (!st) continue;
+    const start = icsDatum(st.wert, st.params); if (!start) continue;
+    const sum = feld("SUMMARY"), loc = feld("LOCATION"), rr = feld("RRULE");
+    const titel = (sum ? sum.wert : "Termin").replace(/\\,/g, ",").replace(/\\n/g, " ");
+    const ort = loc ? loc.wert.replace(/\\,/g, ",") : "";
+    // Ausnahmen (gelöschte Einzeltermine einer Serie)
+    const exdates = new Set();
+    for (const m of teil.matchAll(/^EXDATE[^:]*:(.*)$/gm))
+      m[1].split(",").forEach(x => { const d = icsDatum(x.trim()); if (d) exdates.add(d.datum); });
+    const basis = { titel, ort, zeit: start.zeit, gcal: true };
+    if (!rr) {
+      if (start.datum >= vonDs && start.datum <= bisDs && !exdates.has(start.datum)) events.push(Object.assign({ datum: start.datum }, basis));
+      continue;
+    }
+    // Einfache Serien: DAILY, WEEKLY (BYDAY), MONTHLY (Monatstag), YEARLY
+    const regeln = {}; rr.wert.split(";").forEach(p => { const [k, v] = p.split("="); regeln[k] = v; });
+    const freq = regeln.FREQ, intervall = +(regeln.INTERVAL || 1);
+    const until = regeln.UNTIL ? icsDatum(regeln.UNTIL).datum : null;
+    const byday = regeln.BYDAY ? regeln.BYDAY.split(",").map(t => RRTAGE[t.replace(/^[-\d]+/, "")]).filter(Boolean) : null;
+    const startD = new Date(start.datum + "T12:00:00");
+    let zaehler = 0;
+    const d = new Date(vonDs + "T12:00:00");
+    const ende = new Date(bisDs + "T12:00:00");
+    for (; d <= ende && zaehler < 400; d.setDate(d.getDate() + 1), zaehler++) {
+      const ds = dstr(d);
+      if (ds < start.datum || (until && ds > until) || exdates.has(ds)) continue;
+      const tage = Math.round((d - startD) / 864e5);
+      let passt = false;
+      if (freq === "DAILY") passt = tage % intervall === 0;
+      else if (freq === "WEEKLY") {
+        const wo = Math.floor(tage / 7);
+        const tagOk = byday ? byday.includes(WD[d.getDay()]) : d.getDay() === startD.getDay();
+        passt = tagOk && (byday ? Math.floor((d - wochenStart(startD)) / 6048e5) % intervall === 0 : wo % intervall === 0);
+      }
+      else if (freq === "MONTHLY") passt = d.getDate() === startD.getDate();
+      else if (freq === "YEARLY") passt = d.getDate() === startD.getDate() && d.getMonth() === startD.getMonth();
+      if (passt) events.push(Object.assign({ datum: ds }, basis));
+    }
+  }
+  return events;
+}
+function ladeGcal(zeigeToast) {
+  const url = (S.einstellungen && S.einstellungen.icsUrl || "").trim();
+  if (!url) { gcal = { events: [], status: "aus", am: null }; return; }
+  gcal.status = "lädt";
+  const von = heute();
+  const bisD = new Date(); bisD.setDate(bisD.getDate() + 60);
+  fetch(url).then(r => { if (!r.ok) throw 0; return r.text(); }).then(text => {
+    gcal.events = parseICS(text, von, dstr(bisD));
+    gcal.status = "ok"; gcal.am = new Date();
+    if (zeigeToast) toast(gcal.events.length + " Google-Termine geladen");
+    render();
+  }).catch(() => {
+    gcal.status = "fehler";
+    if (zeigeToast) toast("Kalender-Abruf fehlgeschlagen – URL prüfen");
+    render();
+  });
+}
+function gcalUrlSpeichern() {
+  if (!S.einstellungen) S.einstellungen = {};
+  S.einstellungen.icsUrl = $("gcal-url").value.trim();
+  save("einstellungen"); ladeGcal(true);
+}
+
 /* ---------- Wiederkehrende Logik ---------- */
 function termineAm(datumStr) {
   const w = wtag(datumStr);
-  return S.termine.filter(t =>
-    t.datum === datumStr || (t.wdh === "woechentlich" && wtag(t.datum) === w && t.datum <= datumStr)
-  ).sort((a, b) => (a.zeit || "99") < (b.zeit || "99") ? -1 : 1);
+  const eigene = S.termine.filter(t =>
+    t.datum === datumStr || (t.wdh === "woechentlich" && wtag(t.datum) === w && t.datum <= datumStr));
+  const google = gcal.events.filter(e => e.datum === datumStr);
+  return eigene.concat(google).sort((a, b) => (a.zeit || "99") < (b.zeit || "99") ? -1 : 1);
 }
 function routinenAm(datumStr) {
   const w = wtag(datumStr);
@@ -169,6 +288,33 @@ function kidAufgabenAm(kindId, datumStr) {
 /* ============================================================
    TAB: HEUTE
    ============================================================ */
+function ichId() { try { return localStorage.getItem("whanau-ich"); } catch (e) { return null; } }
+function ichName() {
+  const m = mitglied(ichId());
+  if (m) return m.name;
+  return meinName ? meinName.charAt(0).toUpperCase() + meinName.slice(1) : "";
+}
+function kioskAktiv() {
+  try { return localStorage.getItem("whanau-kiosk") === "1" || new URLSearchParams(location.search).get("kiosk") === "1"; } catch (e) { return false; }
+}
+function kioskSetzen(an) {
+  try { an ? localStorage.setItem("whanau-kiosk", "1") : localStorage.removeItem("whanau-kiosk"); } catch (e) {}
+  render(); toast(an ? "Kiosk-Modus aktiv – App startet ab jetzt im Kinderbereich" : "Kiosk-Modus aus");
+  if (an) openKids();
+}
+function ichSetzen(id) {
+  try { localStorage.setItem("whanau-ich", id); } catch (e) {}
+  sheetClose(); render(); toast("Hallo " + mName(id) + "!");
+}
+function ichFragen() {
+  if (!S.mitglieder.length) return;
+  const sortiert = [...erwachsene(), ...kinder()];
+  $("sheet").innerHTML = `<h3>👋 Wer nutzt die App auf diesem Gerät?</h3>
+    <div class="hint" style="margin:-6px 0 12px">Damit Begrüßung und Zettel deinen richtigen Namen tragen. Änderbar unter Mehr → Familie.</div>` +
+    sortiert.map(m => `<button class="row" style="width:100%;text-align:left" onclick="ichSetzen('${m.id}')">
+      ${avatarHtml(m.id, 34)}<div class="grow"><div class="t">${esc(m.name)}</div></div>›</button>`).join("");
+  $("modal").classList.add("open");
+}
 function gruss() {
   const st = new Date().getHours();
   if (st < 10) return "Mōrena";          // Guten Morgen (Māori)
@@ -187,7 +333,7 @@ function rHeute() {
   const h = heute(), m = morgen();
   let out = `<div class="hero">
     <svg class="fern" viewBox="0 0 100 100"><path d="M50 95 C50 60 50 40 50 10 M50 80 C35 75 25 62 26 50 M50 80 C65 75 75 62 74 50 M50 62 C38 58 31 48 32 39 M50 62 C62 58 69 48 68 39 M50 45 C41 42 36 34 37 27 M50 45 C59 42 64 34 63 27" stroke="#17695B" stroke-width="3.5" fill="none" stroke-linecap="round"/></svg>
-    <div class="kia">${gruss()}${meinName ? ", " + esc(meinName.charAt(0).toUpperCase() + meinName.slice(1)) : ""}!</div>
+    <div class="kia">${gruss()}${ichName() ? ", " + esc(ichName()) : ""}!</div>
     <div class="datum">${fmtLang(new Date())}</div></div>`;
 
   // Onboarding für den allerersten Start
@@ -253,19 +399,20 @@ function rHeute() {
   }).join("");
   out += `</div>`;
 
-  // Packliste morgen
-  const pk = S.packlisten.filter(p => p.wochentag === wtag(m));
-  if (pk.length) {
-    out += `<div class="card"><h2>🎒 Morgen einpacken (${fmt(m)})</h2>` +
-      pk.map(p => `<div class="row"><div class="grow"><div class="t">${esc(p.was)}</div></div>${p.kindId ? avatarHtml(p.kindId) : ""}</div>`).join("") + `</div>`;
-  }
-
   // Zettel für mich (ungelesen/offen)
   const zt = S.zettel.filter(z => !z.erledigt);
   if (zt.length) {
     out += `<div class="card"><h2>📮 Zettelkasten<span class="cnt">${zt.length}</span></h2>` +
       zt.slice(0, 3).map(z => `<div class="row"><div class="grow"><div class="t">${esc(z.text)}</div><div class="s">von ${esc(z.von || "?")}</div></div>
       <button aria-label="Abhaken" class="check" onclick="zettelToggle('${z.id}')"></button></div>`).join("") + `</div>`;
+  }
+
+  // Offenes Taschengeld
+  const tgOffen = kinder().map(k => ({ k, summe: tgAusstehend(k.id), wochen: tgOffeneWochen(k.id).length })).filter(x => x.summe > 0);
+  if (tgOffen.length) {
+    out += `<div class="card"><h2>💰 Taschengeld offen</h2>` +
+      tgOffen.map(x => `<div class="row"><div class="grow"><div class="t">${esc(x.k.name)}: ${euro(x.summe)}</div>
+        <div class="s">${x.wochen} ${x.wochen === 1 ? "Woche" : "Wochen"} nicht abgeholt</div></div>${avatarHtml(x.k.id)}</div>`).join("") + `</div>`;
   }
 
   // Wochenbilanz
@@ -292,7 +439,8 @@ function rTermine() {
   if (sub.termine === "ferien") return out + rFerien();
 
   // 14-Tage-Vorschau
-  out += `<div class="card"><h2>📅 Nächste 14 Tage</h2>`;
+  const gcalInfo = gcal.status === "ok" ? `🌐 ${gcal.events.length} Google-Termine` : gcal.status === "fehler" ? "🌐 Abruf fehlgeschlagen" : gcal.status === "lädt" ? "🌐 lädt…" : "";
+  out += `<div class="card"><h2>📅 Nächste 14 Tage${gcalInfo ? `<span class="cnt">${gcalInfo} <button class="btn small ghost" onclick="ladeGcal(true)">↻</button></span>` : ""}</h2>`;
   let any = false;
   for (let i = 0; i < 14; i++) {
     const d = new Date(); d.setDate(d.getDate() + i);
@@ -300,9 +448,9 @@ function rTermine() {
     if (!ts.length) continue; any = true;
     out += `<div class="weekrow ${i === 0 ? "today" : ""}"><div class="day"><div class="wd">${WD[d.getDay()]}</div><div class="dt">${d.getDate()}.${d.getMonth() + 1}.</div></div><div class="grow">`;
     out += ts.map(t => `<div class="row"><div class="grow"><div class="t">${esc(t.titel)}</div>
-      <div class="s">${t.zeit ? t.zeit + " Uhr" : "ganztägig"}${t.ort ? " · " + esc(t.ort) : ""}${t.wdh === "woechentlich" ? " · 🔁 wöchentlich" : ""}</div></div>
+      <div class="s">${t.zeit ? t.zeit + " Uhr" : "ganztägig"}${t.ort ? " · " + esc(t.ort) : ""}${t.wdh === "woechentlich" ? " · 🔁 wöchentlich" : ""}${t.gcal ? " · 🌐 Google" : ""}</div></div>
       ${(t.mitglieder || []).map(id => avatarHtml(id)).join("")}
-      <button class="del" aria-label="Löschen" onclick="terminDel('${t.id}')">✕</button></div>`).join("");
+      ${t.gcal ? "" : `<button class="del" aria-label="Löschen" onclick="terminDel('${t.id}')">✕</button>`}</div>`).join("");
     out += `</div></div>`;
   }
   if (!any) out += `<div class="empty">Keine Termine in den nächsten zwei Wochen.</div>`;
@@ -378,7 +526,8 @@ function rListen() {
   if (sub.listen === "pack") return out + rPacklisten();
 
   const offen = S.einkauf.filter(e => !e.erledigt), fertig = S.einkauf.filter(e => e.erledigt);
-  const kats = [...new Set(offen.map(e => e.kategorie || "Sonstiges"))].sort();
+  const kats = KAT_ORDER.filter(k => offen.some(e => (e.kategorie || "Sonstiges") === k))
+    .concat([...new Set(offen.map(e => e.kategorie || "Sonstiges"))].filter(k => !KAT_ORDER.includes(k)));
   out += `<div class="card"><h2>🛒 Einkaufsliste<span class="cnt">${offen.length} offen</span></h2>`;
   if (!offen.length) out += `<div class="empty">Alles eingekauft. 🧺</div>`;
   kats.forEach(k => {
@@ -389,7 +538,7 @@ function rListen() {
        <button class="del" aria-label="Löschen" onclick="einkaufDel('${e.id}')">✕</button></div>`).join("");
   });
   out += `<div class="addform"><input id="ek-name" placeholder="Was fehlt?" onkeydown="if(event.key==='Enter')einkaufAdd()">
-    <select id="ek-kat" style="max-width:130px"><option>Lebensmittel</option><option>Drogerie</option><option>Getränke</option><option>Haushalt</option><option>Sonstiges</option></select>
+    <select id="ek-kat" style="max-width:120px"><option value="auto">🪄 Auto</option>${KAT_ORDER.map(k => `<option>${k}</option>`).join("")}</select>
     <button class="btn" onclick="einkaufAdd()">＋</button></div>`;
   const chips = schnellArtikel();
   if (chips.length) out += `<div class="hint" style="margin-top:10px">Schnell hinzufügen (kauft ihr oft):</div>
@@ -403,9 +552,31 @@ function rListen() {
   out += `</div>`;
   return out;
 }
+/* Kategorien in Supermarkt-Laufreihenfolge + Stichwort-Erkennung */
+const KAT_ORDER = ["Obst & Gemüse", "Brot & Backwaren", "Kühlregal", "Fleisch & Fisch", "Vorräte", "Tiefkühl", "Getränke", "Drogerie", "Haushalt", "Sonstiges"];
+const KAT_WORTE = {
+  "Obst & Gemüse": ["apfel","äpfel","banane","birne","trauben","erdbeer","beeren","zitrone","limette","orange","mandarine","melone","kiwi","tomate","cherrytomaten","gurke","salatgurke","salat","kopfsalat","feldsalat","rucola","karotte","möhre","zwiebel","frühlingszwiebel","kartoffel","süßkartoffel","paprika","zucchini","brokkoli","blumenkohl","spinat","blattspinat","lauch","sellerie","knoblauch","ingwer","pilze","champignon","avocado","zuckerschoten","kürbis","radieschen","kohlrabi","basilikum","petersilie","schnittlauch","minze","dill","kräuter","obst","gemüse","rohkost"],
+  "Brot & Backwaren": ["brot","brötchen","baguette","ciabatta","fladenbrot","toast","wraps","naan","croissant","brezel","zwieback"],
+  "Kühlregal": ["milch","butter","margarine","joghurt","quark","skyr","sahne","schmand","crème","creme fraiche","käse","mozzarella","parmesan","feta","halloumi","bergkäse","frischkäse","eier","gnocchi","spätzle","flammkuchenteig","pizzateig","teig","hefe","falafel","hummus","tortellini","aufschnitt","pudding"],
+  "Fleisch & Fisch": ["hähnchen","hühnchen","pute","hack","rinderhack","schnitzel","würstchen","wurst","schinken","kochschinken","speck","salami","steak","gulasch","lachs","lachsfilet","fisch","weißfisch","garnelen","forelle","köfte"],
+  "Vorräte": ["nudeln","spaghetti","penne","fusilli","tagliatelle","suppennudeln","mie","reisnudeln","reispapier","reis","milchreis","risotto","couscous","bulgur","quinoa","linsen","bohnen","kichererbsen","erbsen (glas)","mehl","zucker","paniermehl","haferflocken","müsli","passierte tomaten","gehackte tomaten","tomatenmark","kokosmilch","öl","olivenöl","essig","senf","ketchup","mayo","sojasoße","teriyaki","currypaste","curry","brühe","gemüsebrühe","gewürz","garam","schawarma","zimt","vanille","tahini","erdnuss","sesam","nüsse","mandeln","honig","marmelade","nutella","apfelmus","mais","oliven","sauerkirschen","thunfisch","konserve","dose","kapern","backpulver","chips","kekse","schokolade"],
+  "Tiefkühl": ["tk","tiefkühl","fischstäbchen","pommes","tk-pizza","eis ","eiscreme","erbsen (tk)"],
+  "Getränke": ["wasser","mineralwasser","sprudel","saft","apfelsaft","orangensaft","cola","limo","limonade","eistee","bier","wein","sekt","kaffee","espresso","tee","kakao","hafermilch","mandelmilch"],
+  "Drogerie": ["shampoo","duschgel","seife","zahnpasta","zahnbürste","deo","creme","sonnencreme","windeln","feuchttücher","taschentücher","wattestäbchen","pflaster","binden","tampons","rasier"],
+  "Haushalt": ["spülmittel","spülmaschinentabs","waschmittel","weichspüler","müllbeutel","müllsäcke","küchenrolle","toilettenpapier","klopapier","alufolie","frischhaltefolie","backpapier","schwamm","lappen","batterien","glühbirne","kerzen"]
+};
+const KAT_SUCHE = Object.entries(KAT_WORTE)
+  .flatMap(([kat, worte]) => worte.map(w => [w, kat]))
+  .sort((x, y) => y[0].length - x[0].length); // längste Treffer zuerst (kokosmilch vor milch)
+function autoKategorie(name) {
+  const n = " " + name.toLowerCase() + " ";
+  for (const [wort, kat] of KAT_SUCHE) if (n.includes(wort)) return kat;
+  return "Sonstiges";
+}
 function einkaufAdd() {
   const n = $("ek-name").value.trim(); if (!n) return;
-  S.einkauf.push({ id: uid(), name: n, kategorie: $("ek-kat").value, erledigt: false });
+  const wahl = $("ek-kat") ? $("ek-kat").value : "auto";
+  S.einkauf.push({ id: uid(), name: n, kategorie: wahl === "auto" ? autoKategorie(n) : wahl, erledigt: false });
   save("einkauf");
 }
 function einkaufToggle(id) {
@@ -425,7 +596,7 @@ function schnellArtikel() {
 }
 function schnellAdd(name) {
   const schoen = name.charAt(0).toUpperCase() + name.slice(1);
-  S.einkauf.push({ id: uid(), name: schoen, kategorie: "Lebensmittel", erledigt: false });
+  S.einkauf.push({ id: uid(), name: schoen, kategorie: autoKategorie(schoen), erledigt: false });
   save("einkauf"); vib();
 }
 function einkaufDel(id) { S.einkauf = S.einkauf.filter(x => x.id !== id); save("einkauf"); }
@@ -484,28 +655,92 @@ function routineToggle(id) {
 }
 function routineDel(id) { if (!confirm("Routine löschen?")) return; S.routinen = S.routinen.filter(x => x.id !== id); save("routinen"); }
 
+const PACK_VORLAGEN = [
+  { titel: "Schwimmbad", emoji: "🏊", items: ["Badehose / Badeanzug", "Handtücher", "Schwimmbrille", "Schwimmflügel / Schwimmnudel", "Duschgel & Bürste", "Wechselkleidung", "Snacks & Trinkflaschen", "Eintritt / Geldkarte"] },
+  { titel: "Badesee", emoji: "🏞️", items: ["Badesachen", "Handtücher", "Sonnencreme", "Sonnenschirm / UV-Zelt", "Picknickdecke", "Kühltasche mit Snacks & Getränken", "Sandspielzeug", "Luftmatratze / SUP", "Wechselkleidung", "Mülltüte"] },
+  { titel: "Camping", emoji: "⛺", items: ["Zelt / Dachzelt", "Schlafsäcke", "Isomatten", "Campingstühle & Tisch", "Kocher & Gas", "Töpfe & Geschirr", "Kühlbox", "Stirnlampen", "Powerbank", "Mückenspray", "Erste-Hilfe-Set", "Regenjacken", "Spiele & Karten"] },
+  { titel: "Flugreise", emoji: "✈️", items: ["Ausweise / Reisepässe", "Buchungsunterlagen", "Snacks fürs Handgepäck", "Kinderkopfhörer", "Tablet geladen + Filme offline", "Wechselkleidung im Handgepäck", "Reiseapotheke", "Ladekabel & Adapter", "Kuscheltiere", "Leere Trinkflaschen", "Sonnencreme"] },
+  { titel: "Wandertag", emoji: "🥾", items: ["Wanderschuhe", "Rucksack", "Trinkflaschen", "Brotzeit", "Regenjacken", "Sonnenhut & Sonnencreme", "Erste-Hilfe-Set", "Zeckenzange", "Route offline geladen"] },
+  { titel: "Übernachtung bei Opa", emoji: "🛏️", items: ["Schlafanzug", "Zahnbürste", "Wechselkleidung", "Kuscheltier", "Lieblingsbuch", "Medikamente (falls nötig)"] }
+];
+let aktivePackliste = null;
+function packMigrieren() {
+  // Alte wochentagsbasierte Einträge in eine Liste retten
+  const alte = S.packlisten.filter(p => p.wochentag);
+  if (!alte.length) return;
+  const rest = S.packlisten.filter(p => !p.wochentag);
+  rest.push({ id: uid(), titel: "Schulwoche (alt)", emoji: "🎒", items: alte.map(p => ({ id: uid(), was: (p.wochentag + ": " + p.was), done: false })) });
+  S.packlisten = rest; save("packlisten");
+}
 function rPacklisten() {
-  let out = `<div class="card"><h2>🎒 Packlisten<span class="cnt">wochentags-fest</span></h2>
-    <div class="hint" style="margin:-4px 0 10px">Was muss an welchem Tag mit? Erscheint am Vorabend unter „Heute".</div>`;
-  SCHULTAGE.forEach(t => {
-    const items = S.packlisten.filter(p => p.wochentag === t);
-    out += `<div class="weekrow"><div class="day"><div class="wd">${t}</div></div><div class="grow">`;
-    out += items.length ? items.map(p => `<div class="row"><div class="grow"><div class="t">${esc(p.was)}</div></div>
-      ${p.kindId ? avatarHtml(p.kindId) : ""}<button class="del" aria-label="Löschen" onclick="packDel('${p.id}')">✕</button></div>`).join("") : `<div class="empty">–</div>`;
-    out += `</div></div>`;
-  });
-  out += `<div class="formgrid"><input id="pk-was" class="full" placeholder="z. B. Schwimmtasche">
-    <select id="pk-tag">${SCHULTAGE.map(t => `<option>${t}</option>`).join("")}</select>
-    <select id="pk-kind"><option value="">Für wen?</option>${kinder().map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join("")}</select>
-    <button class="btn full" onclick="packAdd()">Hinzufügen</button></div></div>`;
+  packMigrieren();
+  const liste = S.packlisten.find(l => l.id === aktivePackliste);
+  if (liste) return rPacklisteDetail(liste);
+  let out = `<div class="card"><h2>🎒 Packlisten<span class="cnt">${S.packlisten.length}</span></h2>
+    <div class="hint" style="margin:-4px 0 10px">Themenlisten zum Abhaken – Schwimmbad, Camping, Flugreise … Haken lassen sich fürs nächste Mal zurücksetzen.</div>`;
+  out += S.packlisten.map(l => {
+    const items = l.items || [], fertig = items.filter(i => i.done).length;
+    return `<div class="row"><button class="grow" style="text-align:left" onclick="aktivePackliste='${l.id}';render()">
+      <div class="t">${esc(l.emoji || "🎒")} ${esc(l.titel)}</div>
+      <div class="s">${fertig} von ${items.length} gepackt</div></button>
+      <span style="color:var(--muted)">›</span></div>`;
+  }).join("") || `<div class="empty">Noch keine Listen – Vorlage antippen oder eigene anlegen.</div>`;
+  const offen = PACK_VORLAGEN.filter(v => !S.packlisten.some(l => l.titel === v.titel));
+  if (offen.length) out += `<div class="hint" style="margin-top:10px">Vorlagen:</div>
+    <div class="chiprow">${offen.map(v => `<button onclick="packVorlage('${esc(v.titel)}')">${v.emoji} ${esc(v.titel)}</button>`).join("")}</div>`;
+  out += `<div class="addform"><input id="pl-titel" placeholder="Eigene Liste (z. B. Skiurlaub)" onkeydown="if(event.key==='Enter')packListeAdd()">
+    <button class="btn" onclick="packListeAdd()">＋</button></div></div>`;
   return out;
 }
-function packAdd() {
-  const w = $("pk-was").value.trim(); if (!w) return toast("Was fehlt?");
-  S.packlisten.push({ id: uid(), was: w, wochentag: $("pk-tag").value, kindId: $("pk-kind").value });
-  save("packlisten"); toast("Gespeichert");
+function rPacklisteDetail(l) {
+  const items = l.items || [];
+  let out = `<button class="btn small ghost" style="margin-bottom:12px" onclick="aktivePackliste=null;render()">‹ Alle Listen</button>`;
+  out += `<div class="card"><h2>${esc(l.emoji || "🎒")} ${esc(l.titel)}<span class="cnt">${items.filter(i => i.done).length}/${items.length}</span></h2>`;
+  out += items.map(i => `<div class="row ${i.done ? "done" : ""}">
+    <button aria-label="Abhaken" class="check ${i.done ? "on" : ""}" onclick="packItemToggle('${l.id}','${i.id}')">${i.done ? "✓" : ""}</button>
+    <div class="grow"><div class="t">${esc(i.was)}</div></div>
+    <button class="del" aria-label="Löschen" onclick="packItemDel('${l.id}','${i.id}')">✕</button></div>`).join("") || `<div class="empty">Liste ist leer.</div>`;
+  out += `<div class="addform"><input id="pi-was" placeholder="Was muss mit?" onkeydown="if(event.key==='Enter')packItemAdd('${l.id}')">
+    <button class="btn" onclick="packItemAdd('${l.id}')">＋</button></div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn small ghost" style="flex:1" onclick="packReset('${l.id}')">↩️ Haken zurücksetzen</button>
+      <button class="btn small coral" onclick="packListeDel('${l.id}')">Liste löschen</button>
+    </div></div>`;
+  return out;
 }
-function packDel(id) { S.packlisten = S.packlisten.filter(x => x.id !== id); save("packlisten"); }
+function packVorlage(titel) {
+  const v = PACK_VORLAGEN.find(x => x.titel === titel); if (!v) return;
+  const l = { id: uid(), titel: v.titel, emoji: v.emoji, items: v.items.map(w => ({ id: uid(), was: w, done: false })) };
+  S.packlisten.push(l); save("packlisten"); aktivePackliste = l.id; render();
+}
+function packListeAdd() {
+  const t = $("pl-titel").value.trim(); if (!t) return toast("Name fehlt");
+  const l = { id: uid(), titel: t, emoji: "🎒", items: [] };
+  S.packlisten.push(l); save("packlisten"); aktivePackliste = l.id; render();
+}
+function packListeDel(id) {
+  if (!confirm("Liste komplett löschen?")) return;
+  S.packlisten = S.packlisten.filter(l => l.id !== id); aktivePackliste = null; save("packlisten");
+}
+function packItemAdd(listeId) {
+  const w = $("pi-was").value.trim(); if (!w) return;
+  const l = S.packlisten.find(x => x.id === listeId); if (!l) return;
+  if (!l.items) l.items = [];
+  l.items.push({ id: uid(), was: w, done: false }); save("packlisten");
+}
+function packReset(listeId) {
+  const l = S.packlisten.find(x => x.id === listeId); if (!l) return;
+  (l.items || []).forEach(i => i.done = false); save("packlisten"); toast("Bereit fürs nächste Mal");
+}
+function packItemToggle(listeId, itemId) {
+  const l = S.packlisten.find(x => x.id === listeId); if (!l) return;
+  const i = (l.items || []).find(x => x.id === itemId); if (!i) return;
+  i.done = !i.done; vib(); save("packlisten");
+}
+function packItemDel(listeId, itemId) {
+  const l = S.packlisten.find(x => x.id === listeId); if (!l) return;
+  l.items = (l.items || []).filter(x => x.id !== itemId); save("packlisten");
+}
 
 /* ============================================================
    TAB: ESSEN (Wochenplan + Kochbuch)
@@ -515,23 +750,38 @@ function rEssen() {
   if (sub.essen === "kochbuch") return out + rKochbuch();
 
   const start = wochenStart(new Date());
-  out += `<div class="card"><h2>🍽️ Essensplan · KW ${isoWoche(new Date())}</h2>`;
+  out += `<div class="card"><h2>🍽️ Essensplan · KW ${isoWoche(new Date())}</h2>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn ghost small" style="flex:1" onclick="wocheFuellen(false)">✨ Offene Tage füllen</button>
+      <button class="btn ghost small" style="flex:1" onclick="wocheFuellen(true)">🎲 Woche neu würfeln</button>
+    </div>`;
   for (let i = 0; i < 7; i++) {
     const d = new Date(start); d.setDate(d.getDate() + i);
     const ds = dstr(d), plan = S.essensplan[ds] || {};
     const dish = S.kochbuch.find(x => x.id === plan.dishId);
     out += `<div class="weekrow ${ds === heute() ? "today" : ""}"><div class="day"><div class="wd">${WD[d.getDay()]}</div><div class="dt">${d.getDate()}.${d.getMonth() + 1}.</div></div>
-      <div class="grow"><div class="addform" style="margin:0">
-        <select onchange="essenSet('${ds}',this.value)" style="flex:1">
-          <option value="">${plan.text ? esc(plan.text) : "– wählen –"}</option>
-          ${S.kochbuch.map(k => `<option value="${k.id}" ${plan.dishId === k.id ? "selected" : ""}>${esc(k.name)}</option>`).join("")}
+      <div class="grow">`;
+    if (dish) {
+      out += `<div class="row" style="padding:4px 0;border:none">
+        <button class="grow" style="text-align:left" onclick="dishSheet('${dish.id}','${ds}')">
+          <div class="t">${esc(dish.name)} <span style="color:var(--muted);font-weight:400">›</span></div>
+          <div class="s">${ART_ICON[dish.art] || ""} ${dish.zeit === "wochenende" ? "🕐" : "⚡"} · antippen für Rezept & Zutaten</div>
+        </button>
+        <button class="del" aria-label="Löschen" title="Eintrag entfernen" onclick="essenClear('${ds}')">✕</button></div>`;
+    } else if (plan.text) {
+      out += `<div class="row" style="padding:4px 0;border:none">
+        <button class="grow" style="text-align:left" onclick="essenSet('${ds}','__frei')"><div class="t">${esc(plan.text)}</div><div class="s">✏️ antippen zum Ändern</div></button>
+        <button class="del" aria-label="Löschen" onclick="essenClear('${ds}')">✕</button></div>`;
+    } else {
+      out += `<select onchange="essenSet('${ds}',this.value)" style="width:100%">
+          <option value="">– wählen –</option>
+          ${S.kochbuch.map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join("")}
           <option value="__frei">✏️ Freitext…</option>
-        </select>
-        ${dish && dish.zutaten && dish.zutaten.length ? `<button class="btn small ghost" title="Zutaten auf Einkaufsliste" onclick="zutatenAufListe('${dish.id}')">🛒</button>` : ""}
-        ${(plan.text || plan.dishId) ? `<button class="del" aria-label="Löschen" title="Eintrag entfernen" onclick="essenClear('${ds}')">✕</button>` : ""}
-      </div></div></div>`;
+        </select>`;
+    }
+    out += `</div></div>`;
   }
-  out += `<div class="hint">🛒 überträgt die Zutaten des Gerichts auf die Einkaufsliste.</div></div>`;
+  out += `<div class="hint">Geplante Tage antippen → Rezept, Zutaten und 🛒-Übertrag.</div></div>`;
 
   // Smart-Vorschläge für offene Tage
   const offeneTage = [];
@@ -574,7 +824,7 @@ function zutatenAufListe(dishId) {
   let n = 0;
   (d.zutaten || []).forEach(z => {
     if (!S.einkauf.some(e => !e.erledigt && e.name.toLowerCase() === z.toLowerCase())) {
-      S.einkauf.push({ id: uid(), name: z, kategorie: "Lebensmittel", erledigt: false }); n++;
+      S.einkauf.push({ id: uid(), name: z, kategorie: autoKategorie(z), erledigt: false }); n++;
     }
   });
   save("einkauf"); toast(n + " Zutaten auf der Einkaufsliste");
@@ -584,50 +834,50 @@ function zutatenAufListe(dishId) {
    Basics (Salz, Pfeffer, Öl, Gewürze) werden als vorhanden angenommen. */
 const STARTER_KOCHBUCH = [
   // Italienisch / Mediterran
-  { name: "Spaghetti Bolognese", art: "fleisch", zeit: "schnell", kueche: "ital", zutaten: ["Spaghetti", "Rinderhack", "Passierte Tomaten", "Zwiebel", "Karotten", "Parmesan"] },
-  { name: "Penne mit Tomaten-Sahne & verstecktem Gemüse", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Penne", "Passierte Tomaten", "Sahne", "Zucchini", "Karotten", "Parmesan"] },
-  { name: "Gnocchi-Pfanne mit Zucchini & Cherrytomaten", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Gnocchi", "Zucchini", "Cherrytomaten", "Knoblauch", "Mozzarella", "Basilikum"] },
-  { name: "Pizza selbst belegt", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Mehl", "Hefe", "Passierte Tomaten", "Mozzarella", "Paprika", "Mais", "Schinken (optional)"] },
-  { name: "Tagliatelle mit Lachs & Spinat", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Tagliatelle", "Lachsfilet", "Blattspinat", "Sahne", "Zitrone", "Knoblauch"] },
-  { name: "Minestrone mit Parmesan", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Suppennudeln", "Karotten", "Zucchini", "Sellerie", "Weiße Bohnen", "Gehackte Tomaten", "Parmesan"] },
-  { name: "Zitronen-Hähnchen mit Reis", art: "fleisch", zeit: "schnell", kueche: "ital", zutaten: ["Hähnchenbrust", "Reis", "Zitrone", "Butter", "Brokkoli"] },
-  { name: "Ofengemüse mit Halloumi", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Kartoffeln", "Paprika", "Zucchini", "Rote Zwiebeln", "Halloumi", "Kräuterquark"] },
-  { name: "Erbsen-Risotto", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Risottoreis", "Erbsen (TK)", "Zwiebel", "Gemüsebrühe", "Parmesan", "Butter"] },
-  { name: "Caprese-Hähnchen aus dem Ofen", art: "fleisch", zeit: "wochenende", kueche: "ital", zutaten: ["Hähnchenbrust", "Tomaten", "Mozzarella", "Basilikum", "Ciabatta", "Salat"] },
-  { name: "Thunfisch-Tomaten-Pasta", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Fusilli", "Thunfisch (Dose)", "Gehackte Tomaten", "Zwiebel", "Mais", "Parmesan"] },
+  { name: "Spaghetti Bolognese", tipp: "Zwiebel und geriebene Karotte anbraten, Hack krümelig braten, Passata dazu, 15 Min köcheln – fertig mit Parmesan.", art: "fleisch", zeit: "schnell", kueche: "ital", zutaten: ["Spaghetti", "Rinderhack", "Passierte Tomaten", "Zwiebel", "Karotten", "Parmesan"] },
+  { name: "Penne mit Tomaten-Sahne & verstecktem Gemüse", tipp: "Zucchini und Karotten fein reiben und in der Soße mitkochen – die Kinder merken nichts.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Penne", "Passierte Tomaten", "Sahne", "Zucchini", "Karotten", "Parmesan"] },
+  { name: "Gnocchi-Pfanne mit Zucchini & Cherrytomaten", tipp: "Gnocchi direkt in der Pfanne goldbraun braten (nicht kochen!), Gemüse dazu, Mozzarella zum Schluss.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Gnocchi", "Zucchini", "Cherrytomaten", "Knoblauch", "Mozzarella", "Basilikum"] },
+  { name: "Pizza selbst belegt", tipp: "Teig 1 Std gehen lassen; jeder belegt seine Hälfte selbst – Ofen auf Maximum, Pizza aufs heiße Blech.", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Mehl", "Hefe", "Passierte Tomaten", "Mozzarella", "Paprika", "Mais", "Schinken (optional)"] },
+  { name: "Tagliatelle mit Lachs & Spinat", tipp: "Lachs würfeln, kurz anbraten, rausnehmen. Spinat in Sahne zusammenfallen lassen, Lachs zurück, Zitrone drüber.", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Tagliatelle", "Lachsfilet", "Blattspinat", "Sahne", "Zitrone", "Knoblauch"] },
+  { name: "Minestrone mit Parmesan", tipp: "Alles Gemüse klein würfeln, mit Tomaten und Brühe 20 Min köcheln, Nudeln die letzten 8 Min mitkochen.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Suppennudeln", "Karotten", "Zucchini", "Sellerie", "Weiße Bohnen", "Gehackte Tomaten", "Parmesan"] },
+  { name: "Zitronen-Hähnchen mit Reis", tipp: "Hähnchen in Streifen braten, mit Zitronensaft und Butter ablöschen – die Soße über den Reis.", art: "fleisch", zeit: "schnell", kueche: "ital", zutaten: ["Hähnchenbrust", "Reis", "Zitrone", "Butter", "Brokkoli"] },
+  { name: "Ofengemüse mit Halloumi", tipp: "Alles in grobe Stücke, mit Öl mischen, 25 Min bei 200 °C – Halloumi die letzten 10 Min obendrauf.", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Kartoffeln", "Paprika", "Zucchini", "Rote Zwiebeln", "Halloumi", "Kräuterquark"] },
+  { name: "Erbsen-Risotto", tipp: "Reis glasig dünsten, Brühe kellenweise zugeben und rühren, Erbsen und Parmesan zum Schluss.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Risottoreis", "Erbsen (TK)", "Zwiebel", "Gemüsebrühe", "Parmesan", "Butter"] },
+  { name: "Caprese-Hähnchen aus dem Ofen", tipp: "Hähnchenbrust einschneiden, Tomate und Mozzarella hineinstecken, 25 Min bei 180 °C.", art: "fleisch", zeit: "wochenende", kueche: "ital", zutaten: ["Hähnchenbrust", "Tomaten", "Mozzarella", "Basilikum", "Ciabatta", "Salat"] },
+  { name: "Thunfisch-Tomaten-Pasta", tipp: "Zwiebel andünsten, Tomaten und abgetropften Thunfisch dazu, 10 Min köcheln – Mais macht es kindertauglich.", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Fusilli", "Thunfisch (Dose)", "Gehackte Tomaten", "Zwiebel", "Mais", "Parmesan"] },
   // Deutsch-klassisch
-  { name: "Kartoffelpuffer mit Apfelmus", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Kartoffeln", "Eier", "Mehl", "Zwiebel", "Apfelmus"] },
-  { name: "Linsensuppe mit Würstchen", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Tellerlinsen", "Kartoffeln", "Karotten", "Lauch", "Würstchen", "Essig"] },
-  { name: "Käsespätzle mit Salat", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Spätzle", "Bergkäse gerieben", "Zwiebeln", "Kopfsalat", "Schnittlauch"] },
-  { name: "Frikadellen mit Püree & Erbsen", art: "fleisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Gemischtes Hack", "Brötchen (alt)", "Ei", "Zwiebel", "Kartoffeln", "Milch", "Erbsen (TK)"] },
-  { name: "Pfannkuchen süß & herzhaft", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Mehl", "Eier", "Milch", "Apfelmus", "Käse", "Schinken (optional)"] },
-  { name: "Kartoffelsuppe", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Kartoffeln", "Karotten", "Lauch", "Gemüsebrühe", "Sahne", "Brot"] },
-  { name: "Fischstäbchen mit Püree & Gurkensalat", art: "fisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Fischstäbchen", "Kartoffeln", "Milch", "Butter", "Salatgurke", "Joghurt", "Dill"] },
-  { name: "Schnitzel mit Kartoffelsalat", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Schweineschnitzel", "Paniermehl", "Eier", "Kartoffeln", "Gurke", "Brühe", "Senf"] },
-  { name: "Nudelauflauf mit Schinken & Brokkoli", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Fusilli", "Kochschinken", "Brokkoli", "Sahne", "Eier", "Käse gerieben"] },
-  { name: "Milchreis mit warmen Kirschen", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Milchreis", "Milch", "Sauerkirschen (Glas)", "Zimt", "Zucker"] },
-  { name: "Ofenkartoffeln mit Kräuterquark & Rohkost", art: "veggie", zeit: "wochenende", kueche: "deutsch", zutaten: ["Große Kartoffeln", "Quark", "Schnittlauch", "Karotten", "Paprika", "Gurke"] },
-  { name: "Flammkuchen", art: "fleisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Flammkuchenteig", "Schmand", "Speckwürfel", "Zwiebeln", "Feldsalat"] },
+  { name: "Kartoffelpuffer mit Apfelmus", tipp: "Kartoffeln reiben und gut ausdrücken (wichtig!), mit Ei und Mehl mischen, portionsweise knusprig braten.", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Kartoffeln", "Eier", "Mehl", "Zwiebel", "Apfelmus"] },
+  { name: "Linsensuppe mit Würstchen", tipp: "Linsen mit Gemüse und Brühe 40 Min köcheln, Würstchen die letzten 10 Min, Schuss Essig zum Schluss.", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Tellerlinsen", "Kartoffeln", "Karotten", "Lauch", "Würstchen", "Essig"] },
+  { name: "Käsespätzle mit Salat", tipp: "Spätzle mit Käse schichten und im Ofen schmelzen, Röstzwiebeln drüber – Salat als frischer Ausgleich.", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Spätzle", "Bergkäse gerieben", "Zwiebeln", "Kopfsalat", "Schnittlauch"] },
+  { name: "Frikadellen mit Püree & Erbsen", tipp: "Eingeweichtes Brötchen, Hack, Ei, Zwiebel verkneten, flache Klopse langsam braten – innen saftig.", art: "fleisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Gemischtes Hack", "Brötchen (alt)", "Ei", "Zwiebel", "Kartoffeln", "Milch", "Erbsen (TK)"] },
+  { name: "Pfannkuchen süß & herzhaft", tipp: "1 Tasse Mehl, 1 Tasse Milch, 2 Eier – dünn ausbacken; erst herzhaft mit Käse, dann süß mit Apfelmus.", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Mehl", "Eier", "Milch", "Apfelmus", "Käse", "Schinken (optional)"] },
+  { name: "Kartoffelsuppe", tipp: "Alles weich kochen, pürieren, Sahne dazu – mit Brotwürfeln aus der Pfanne servieren.", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Kartoffeln", "Karotten", "Lauch", "Gemüsebrühe", "Sahne", "Brot"] },
+  { name: "Fischstäbchen mit Püree & Gurkensalat", tipp: "Fischstäbchen im Ofen knuspriger als in der Pfanne; Gurkensalat mit Joghurt-Dill-Dressing.", art: "fisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Fischstäbchen", "Kartoffeln", "Milch", "Butter", "Salatgurke", "Joghurt", "Dill"] },
+  { name: "Schnitzel mit Kartoffelsalat", tipp: "Schnitzel dünn klopfen, panieren, in reichlich Butterschmalz schwimmend goldbraun braten.", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Schweineschnitzel", "Paniermehl", "Eier", "Kartoffeln", "Gurke", "Brühe", "Senf"] },
+  { name: "Nudelauflauf mit Schinken & Brokkoli", tipp: "Nudeln 2 Min kürzer kochen, alles mischen, Sahne-Ei-Guss drüber, 20 Min bei 180 °C überbacken.", art: "fleisch", zeit: "wochenende", kueche: "deutsch", zutaten: ["Fusilli", "Kochschinken", "Brokkoli", "Sahne", "Eier", "Käse gerieben"] },
+  { name: "Milchreis mit warmen Kirschen", tipp: "Milchreis bei kleinster Hitze 30 Min ziehen lassen (oft rühren), Kirschen mit Saft kurz erwärmen.", art: "veggie", zeit: "schnell", kueche: "deutsch", zutaten: ["Milchreis", "Milch", "Sauerkirschen (Glas)", "Zimt", "Zucker"] },
+  { name: "Ofenkartoffeln mit Kräuterquark & Rohkost", tipp: "Große Kartoffeln 45–60 Min bei 200 °C backen – kaum Arbeit, der Ofen macht alles.", art: "veggie", zeit: "wochenende", kueche: "deutsch", zutaten: ["Große Kartoffeln", "Quark", "Schnittlauch", "Karotten", "Paprika", "Gurke"] },
+  { name: "Flammkuchen", tipp: "Teig hauchdünn ausrollen, Schmand dünn verstreichen, 12 Min bei 230 °C – Kinderhälfte ohne Zwiebeln.", art: "fleisch", zeit: "schnell", kueche: "deutsch", zutaten: ["Flammkuchenteig", "Schmand", "Speckwürfel", "Zwiebeln", "Feldsalat"] },
   // Asiatisch (mild & kindertauglich)
-  { name: "Gebratener Reis mit Ei & Gemüse", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Reis", "Eier", "Erbsen (TK)", "Karotten", "Frühlingszwiebeln", "Sojasoße"] },
-  { name: "Hähnchen-Teriyaki mit Reis & Brokkoli", art: "fleisch", zeit: "schnell", kueche: "asia", zutaten: ["Hähnchenbrust", "Teriyakisoße", "Reis", "Brokkoli", "Sesam"] },
-  { name: "Mildes Gemüse-Kokos-Curry", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Kokosmilch", "Currypaste mild", "Kartoffeln", "Karotten", "Zuckerschoten", "Reis"] },
-  { name: "Bratnudeln mit Gemüse", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Paprika", "Karotten", "Zucchini", "Sojasoße", "Eier"] },
-  { name: "Lachs-Teriyaki mit Reis", art: "fisch", zeit: "schnell", kueche: "asia", zutaten: ["Lachsfilet", "Teriyakisoße", "Reis", "Gurke", "Sesam"] },
-  { name: "Sommerrollen zum Selberrollen", art: "veggie", zeit: "wochenende", kueche: "asia", zutaten: ["Reispapier", "Reisnudeln", "Karotten", "Gurke", "Salat", "Minze", "Erdnusssoße"] },
-  { name: "Mildes Butter Chicken", art: "fleisch", zeit: "wochenende", kueche: "asia", zutaten: ["Hähnchenbrust", "Passierte Tomaten", "Sahne", "Butter", "Garam Masala", "Reis", "Naan"] },
-  { name: "Schnelle Nudelsuppe mit Ei & Mais", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Gemüsebrühe", "Eier", "Mais", "Frühlingszwiebeln", "Sojasoße"] },
-  { name: "Rotes Linsen-Dal (mild) mit Reis", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Rote Linsen", "Kokosmilch", "Gehackte Tomaten", "Zwiebel", "Curry mild", "Reis"] },
+  { name: "Gebratener Reis mit Ei & Gemüse", tipp: "Am besten mit Reis vom Vortag; Ei zuerst stocken lassen, dann alles zusammen scharf braten.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Reis", "Eier", "Erbsen (TK)", "Karotten", "Frühlingszwiebeln", "Sojasoße"] },
+  { name: "Hähnchen-Teriyaki mit Reis & Brokkoli", tipp: "Hähnchen braten, Teriyakisoße einköcheln bis sie glänzt, Sesam drüber – Brokkoli nur bissfest dämpfen.", art: "fleisch", zeit: "schnell", kueche: "asia", zutaten: ["Hähnchenbrust", "Teriyakisoße", "Reis", "Brokkoli", "Sesam"] },
+  { name: "Mildes Gemüse-Kokos-Curry", tipp: "Currypaste kurz anrösten, mit Kokosmilch ablöschen, Gemüse 15 Min mitköcheln – Schärfe kommt bei Bedarf am Tisch dazu.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Kokosmilch", "Currypaste mild", "Kartoffeln", "Karotten", "Zuckerschoten", "Reis"] },
+  { name: "Bratnudeln mit Gemüse", tipp: "Nudeln kochen, abschrecken, dann mit Gemüsestreifen in heißer Pfanne braten – Sojasoße erst zum Schluss.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Paprika", "Karotten", "Zucchini", "Sojasoße", "Eier"] },
+  { name: "Lachs-Teriyaki mit Reis", tipp: "Lachs auf der Hautseite braten, Soße erst in der letzten Minute dazu, sonst brennt sie an.", art: "fisch", zeit: "schnell", kueche: "asia", zutaten: ["Lachsfilet", "Teriyakisoße", "Reis", "Gurke", "Sesam"] },
+  { name: "Sommerrollen zum Selberrollen", tipp: "Alles in Streifen schneiden und Schüsseln auf den Tisch – jeder rollt selbst, Kinder lieben es.", art: "veggie", zeit: "wochenende", kueche: "asia", zutaten: ["Reispapier", "Reisnudeln", "Karotten", "Gurke", "Salat", "Minze", "Erdnusssoße"] },
+  { name: "Mildes Butter Chicken", tipp: "Hähnchen in Joghurt marinieren (gern schon morgens), Soße aus Tomaten, Butter und Sahne sanft köcheln.", art: "fleisch", zeit: "wochenende", kueche: "asia", zutaten: ["Hähnchenbrust", "Passierte Tomaten", "Sahne", "Butter", "Garam Masala", "Reis", "Naan"] },
+  { name: "Schnelle Nudelsuppe mit Ei & Mais", tipp: "Brühe aufkochen, Nudeln 4 Min, Mais dazu, Ei verquirlt einrühren – in 10 Minuten auf dem Tisch.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Gemüsebrühe", "Eier", "Mais", "Frühlingszwiebeln", "Sojasoße"] },
+  { name: "Rotes Linsen-Dal (mild) mit Reis", tipp: "Linsen mit Tomaten und Kokosmilch 15 Min köcheln – sie zerfallen von selbst zur cremigen Soße.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Rote Linsen", "Kokosmilch", "Gehackte Tomaten", "Zwiebel", "Curry mild", "Reis"] },
   // Orientalisch / Levante
-  { name: "Falafel-Wraps mit Joghurtsoße", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Falafel", "Wraps", "Joghurt", "Gurke", "Tomaten", "Salat"] },
-  { name: "Couscous-Salat mit Feta", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Couscous", "Gurke", "Tomaten", "Feta", "Minze", "Zitrone"] },
-  { name: "Hähnchen-Schawarma-Pfanne mit Fladenbrot", art: "fleisch", zeit: "schnell", kueche: "orient", zutaten: ["Hähnchenbrust", "Schawarma-Gewürz", "Fladenbrot", "Joghurt", "Gurke", "Tomaten"] },
-  { name: "Shakshuka mit Fladenbrot", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Eier", "Gehackte Tomaten", "Paprika", "Zwiebel", "Feta", "Fladenbrot"] },
-  { name: "Ofen-Köfte mit Bulgur & Joghurt-Dip", art: "fleisch", zeit: "wochenende", kueche: "orient", zutaten: ["Rinderhack", "Petersilie", "Zwiebel", "Bulgur", "Joghurt", "Gurke"] },
-  { name: "Hummus-Teller mit warmem Fladenbrot", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Kichererbsen", "Tahini", "Zitrone", "Fladenbrot", "Karotten", "Gurke", "Paprika"] },
+  { name: "Falafel-Wraps mit Joghurtsoße", tipp: "Falafel nach Packung erwärmen, Joghurt mit geriebener Gurke mischen, jeder wickelt selbst.", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Falafel", "Wraps", "Joghurt", "Gurke", "Tomaten", "Salat"] },
+  { name: "Couscous-Salat mit Feta", tipp: "Couscous nur mit heißer Brühe übergießen und 5 Min quellen lassen – kein Kochen nötig.", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Couscous", "Gurke", "Tomaten", "Feta", "Minze", "Zitrone"] },
+  { name: "Hähnchen-Schawarma-Pfanne mit Fladenbrot", tipp: "Hähnchenstreifen mit Gewürz kräftig anbraten, ins warme Fladenbrot mit Joghurtsoße.", art: "fleisch", zeit: "schnell", kueche: "orient", zutaten: ["Hähnchenbrust", "Schawarma-Gewürz", "Fladenbrot", "Joghurt", "Gurke", "Tomaten"] },
+  { name: "Shakshuka mit Fladenbrot", tipp: "Paprika und Zwiebel weich dünsten, Tomaten einköcheln, Mulden formen, Eier hineinschlagen, Deckel drauf.", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Eier", "Gehackte Tomaten", "Paprika", "Zwiebel", "Feta", "Fladenbrot"] },
+  { name: "Ofen-Köfte mit Bulgur & Joghurt-Dip", tipp: "Hack mit viel Petersilie würzen, längliche Röllchen formen, 20 Min bei 200 °C – spritzt nicht, geht nebenbei.", art: "fleisch", zeit: "wochenende", kueche: "orient", zutaten: ["Rinderhack", "Petersilie", "Zwiebel", "Bulgur", "Joghurt", "Gurke"] },
+  { name: "Hummus-Teller mit warmem Fladenbrot", tipp: "Kichererbsen mit Tahini, Zitrone und Eiswürfel cremig mixen – Gemüsesticks zum Dippen.", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Kichererbsen", "Tahini", "Zitrone", "Fladenbrot", "Karotten", "Gurke", "Paprika"] },
   // Schnelle Allrounder
-  { name: "Hähnchen-Wraps mit Salat", art: "fleisch", zeit: "schnell", kueche: "orient", zutaten: ["Wraps", "Hähnchenbrust", "Salat", "Tomaten", "Mais", "Joghurt-Dressing"] },
-  { name: "Backofen-Fisch mit Zitronenkartoffeln", art: "fisch", zeit: "wochenende", kueche: "ital", zutaten: ["Weißfischfilet", "Kartoffeln", "Zitrone", "Cherrytomaten", "Oliven (optional)"] }
+  { name: "Hähnchen-Wraps mit Salat", tipp: "Hähnchen würzig braten, alles in Schüsseln auf den Tisch – Wrap-Buffet, jeder baut seinen eigenen.", art: "fleisch", zeit: "schnell", kueche: "orient", zutaten: ["Wraps", "Hähnchenbrust", "Salat", "Tomaten", "Mais", "Joghurt-Dressing"] },
+  { name: "Backofen-Fisch mit Zitronenkartoffeln", tipp: "Kartoffelscheiben 25 Min vorbacken, Fisch mit Zitrone obendrauf, weitere 15 Min – ein Blech, wenig Abwasch.", art: "fisch", zeit: "wochenende", kueche: "ital", zutaten: ["Weißfischfilet", "Kartoffeln", "Zitrone", "Cherrytomaten", "Oliven (optional)"] }
 ];
 const ART_ICON = { veggie: "🥦", fleisch: "🍗", fisch: "🐟" };
 const KUECHE_LBL = { ital: "Mediterran", deutsch: "Klassisch", asia: "Asiatisch", orient: "Levante" };
@@ -675,6 +925,41 @@ function vorschlagFuer(ds) {
 }
 function vorschlagWeiter(ds) { vorschlagOffset[ds] = (vorschlagOffset[ds] || 0) + 1; render(); }
 function vorschlagNehmen(ds, dishId) { S.essensplan[ds] = { dishId }; save("essensplan"); toast("Übernommen"); }
+function wocheFuellen(alles) {
+  const start = wochenStart(new Date());
+  let n = 0;
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(start); d.setDate(d.getDate() + i);
+    const ds = dstr(d);
+    if (ds < heute()) continue;
+    const belegt = S.essensplan[ds] && (S.essensplan[ds].text || S.essensplan[ds].dishId);
+    if (belegt && !alles) continue;
+    if (alles) vorschlagOffset[ds] = (vorschlagOffset[ds] || 0) + (belegt ? 1 : 0);
+    if (alles && belegt) delete S.essensplan[ds]; // neu würfeln: Platz freimachen für die Balance-Logik
+    const v = vorschlagFuer(ds);
+    if (v) { S.essensplan[ds] = { dishId: v.id }; n++; }
+  }
+  save("essensplan"); toast(n ? n + " Tage geplant 🎲" : "Nichts zu füllen");
+}
+function dishSheet(dishId, ds) {
+  const d = S.kochbuch.find(x => x.id === dishId); if (!d) return;
+  const tipp = d.tipp || (STARTER_KOCHBUCH.find(r => r.name.toLowerCase() === d.name.toLowerCase()) || {}).tipp || "";
+  $("sheet").innerHTML = `<h3>${esc(d.name)}</h3>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin:-6px 0 12px">
+      <span class="chip">${ART_ICON[d.art] || "🥦"} ${d.art === "veggie" ? "vegetarisch" : d.art || "vegetarisch"}</span>
+      <span class="chip">${d.zeit === "wochenende" ? "🕐 mehr Zeit" : "⚡ ≤ 30 Min"}</span>
+      ${d.kueche ? `<span class="chip">${KUECHE_LBL[d.kueche] || esc(d.kueche)}</span>` : ""}
+    </div>
+    ${(d.zutaten || []).length ? `<div class="hint" style="font-weight:600;margin-bottom:4px">Zutaten:</div>
+      ${(d.zutaten || []).map(z => `<div class="row" style="padding:6px 0"><div class="grow">${esc(z)}</div></div>`).join("")}` : ""}
+    ${tipp ? `<div class="hint" style="margin-top:10px;line-height:1.5">👨‍🍳 ${esc(tipp)}</div>` : ""}
+    <div style="display:flex;gap:8px;margin-top:16px">
+      ${(d.zutaten || []).length ? `<button class="btn ghost" style="flex:1" onclick="zutatenAufListe('${d.id}');sheetClose()">🛒 Auf Einkaufsliste</button>` : ""}
+      ${ds ? `<button class="btn ghost" style="flex:1" onclick="essenClear('${ds}');sheetClose()">Aus Plan entfernen</button>` : ""}
+    </div>
+    <button class="btn" style="width:100%;margin-top:8px" onclick="sheetClose()">Schließen</button>`;
+  $("modal").classList.add("open");
+}
 
 function rKochbuch() {
   const fehlend = STARTER_KOCHBUCH.filter(r => !S.kochbuch.some(k => k.name.toLowerCase() === r.name.toLowerCase())).length;
@@ -752,7 +1037,22 @@ function rSterne() {
         <input id="kz-bel-${k.id}" value="${esc(konto.belohnung || "")}" placeholder="Belohnung (z. B. Eis essen)">
         <button class="btn small ghost" onclick="zielSave('${k.id}')">Ziel speichern</button>
         <button class="btn small coral" onclick="sterneReset('${k.id}')">Belohnung eingelöst – auf 0</button>
-      </div></div></div>`;
+      </div></div>
+      <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:12px">
+      <div class="hint" style="font-weight:600;margin-bottom:6px">💰 Taschengeld</div>
+      ${(() => {
+        const tg = tgVon(k.id) || { betrag: 0 };
+        const offen = tgOffeneWochen(k.id);
+        const dieseWoche = tg.betrag > 0 ? ((tg.erhalten || {})[tgKey()] ? "✓ diese Woche erhalten" : "diese Woche noch offen") : "";
+        return `<div class="addform" style="margin:0">
+          <input id="tg-betrag-${k.id}" inputmode="decimal" value="${tg.betrag ? String(tg.betrag).replace(".", ",") : "0"}" style="max-width:90px;text-align:right">
+          <span style="align-self:center;color:var(--muted);font-size:13px">€ / Woche</span>
+          <button class="btn small" onclick="tgSetzen('${k.id}')">Speichern</button></div>
+        ${tg.betrag > 0
+          ? `<div class="hint" style="margin-top:8px">${dieseWoche} · Ausstehend: <strong style="color:${offen.length ? "var(--coral)" : "var(--pounamu)"}">${euro(offen.length * tg.betrag)}</strong>${offen.length ? ` (${offen.length} ${offen.length === 1 ? "Woche" : "Wochen"}) <button class="btn small ghost" onclick="tgAuszahlen('${k.id}')">Als ausgezahlt markieren</button>` : ""}</div>`
+          : `<div class="hint" style="margin-top:8px">0 € = noch kein Taschengeld – der Bereich wird ${esc(k.name)} nicht angezeigt.</div>`}`;
+      })()}
+      </div></div>`;
   });
   return out;
 }
@@ -790,7 +1090,7 @@ function rZettel() {
 }
 function zettelAdd() {
   const t = $("zt-text").value.trim(); if (!t) return;
-  S.zettel.push({ id: uid(), text: t, von: meinName, datum: heute(), erledigt: false });
+  S.zettel.push({ id: uid(), text: t, von: ichName(), datum: heute(), erledigt: false });
   save("zettel");
 }
 function zettelToggle(id) { const z = S.zettel.find(x => x.id === id); if (z) { z.erledigt = !z.erledigt; vib(); save("zettel"); } }
@@ -879,10 +1179,47 @@ function gesundAdd() {
 function gesundDel(id) { S.gesundheit = S.gesundheit.filter(x => x.id !== id); save("gesundheit"); }
 
 /* ----- Notfall & Infos ----- */
+function notfallVorlage() {
+  const k1 = kinder()[0] ? kinder()[0].name : "Kind 1";
+  const k2 = kinder()[1] ? kinder()[1].name : "Kind 2";
+  const vorlage = [
+    ["🚨 Notruf (Feuerwehr/Rettung)", "112"],
+    ["👮 Polizei", "110"],
+    ["🩺 Ärztlicher Bereitschaftsdienst", "116 117"],
+    ["☠️ Giftnotruf (Mainz, für Hessen)", "06131 19240"],
+    ["👶 Kinderarzt", "bitte eintragen"],
+    ["🦷 Zahnarzt", "bitte eintragen"],
+    ["🏫 Schule (Sekretariat)", "bitte eintragen"],
+    ["🧒 Kita / Hort", "bitte eintragen"],
+    ["🏠 Nachbarn (Notfallkontakt)", "bitte eintragen"],
+    ["👵 Oma & Opa", "bitte eintragen"],
+    ["💳 Krankenkasse + Versichertennr.", "bitte eintragen"],
+    ["👕 Kleidergröße " + k1, "bitte eintragen"],
+    ["👟 Schuhgröße " + k1, "bitte eintragen"],
+    ["👕 Kleidergröße " + k2, "bitte eintragen"],
+    ["👟 Schuhgröße " + k2, "bitte eintragen"]
+  ];
+  let n = 0;
+  vorlage.forEach(([titel, wert]) => {
+    if (!S.notfall.some(x => x.titel === titel)) { S.notfall.push({ id: uid(), titel, wert }); n++; }
+  });
+  save("notfall"); toast(n + " Einträge eingefügt – Werte antippen zum Ausfüllen");
+}
+function notfallEdit(id) {
+  const n = S.notfall.find(x => x.id === id); if (!n) return;
+  sheetInput(n.titel, "Nummer / Info", n.wert === "bitte eintragen" ? "" : n.wert, v => {
+    if (v) { n.wert = v; save("notfall"); } else render();
+  });
+}
 function rNotfall() {
   let out = `<div class="card"><h2>📇 Notfall & Infos</h2>
-  <div class="hint" style="margin:-4px 0 8px">Kinderarzt, Schule, Kleidergrößen – alles Wichtige an einem Ort.</div>`;
-  out += S.notfall.map(n => `<div class="row"><div class="grow"><div class="t">${esc(n.titel)}</div><div class="s">${esc(n.wert)}</div></div>
+  <div class="hint" style="margin:-4px 0 8px">Kinderarzt, Schule, Kleidergrößen – alles Wichtige an einem Ort. Werte antippen zum Bearbeiten.</div>`;
+  const fehlt = S.notfall.length < 5;
+  if (fehlt) out += `<button class="btn ghost" style="width:100%;margin-bottom:10px" onclick="notfallVorlage()">📋 Vorlage einfügen (Notruf, Ärzte, Größen …)</button>`;
+  out += S.notfall.map(n => `<div class="row">
+    <button class="grow" style="text-align:left" onclick="notfallEdit('${n.id}')">
+      <div class="t">${esc(n.titel)}</div>
+      <div class="s" style="${n.wert === "bitte eintragen" ? "color:var(--coral)" : ""}">${esc(n.wert)} ✏️</div></button>
     <button class="del" aria-label="Löschen" onclick="notfallDel('${n.id}')">✕</button></div>`).join("") || `<div class="empty">Noch keine Einträge.</div>`;
   out += `<div class="formgrid"><input id="nf-titel" placeholder="z. B. Kinderarzt Dr. …">
     <input id="nf-wert" placeholder="Nummer / Info">
@@ -907,10 +1244,23 @@ function rFamilie() {
     <input id="mg-geb" type="date" class="full" title="Geburtstag (optional)">
     <button class="btn full" onclick="mitgliedAdd()">Hinzufügen</button></div>
     <div class="hint">Geburtstag ist optional – damit erscheinen 🎂-Countdowns und ein Geburtstagsgruß automatisch auf dem Dashboard.</div></div>`;
+  const ich = mitglied(ichId());
+  out += `<div class="card"><h2>📱 Dieses Gerät</h2>
+    <div class="row"><div class="grow"><div class="t">Angemeldet als: ${ich ? esc(ich.name) : "noch nicht festgelegt"}</div>
+    <div class="s">bestimmt Begrüßung & Zettel-Absender auf diesem Handy</div></div>
+    <button class="btn small ghost" onclick="ichFragen()">Ändern</button></div>
+    <div class="row"><div class="grow"><div class="t">Kinder-Tablet (Kiosk-Modus)</div>
+    <div class="s">App startet direkt im Kinderbereich – Ausgang nur mit Eltern-PIN. Für Mias/Lenas Tablets.</div></div>
+    <button class="btn small ${kioskAktiv() ? "coral" : "ghost"}" onclick="kioskSetzen(${kioskAktiv() ? "false" : "true"})">${kioskAktiv() ? "Aus" : "An"}</button></div></div>`;
   out += `<div class="card"><h2>🔒 Eltern-PIN</h2>
     <div class="hint" style="margin:-4px 0 8px">Schützt den Ausgang aus dem Kinderbereich. Standard: 2468</div>
     <div class="addform"><input id="pin-neu" type="number" placeholder="Neue 4-stellige PIN">
     <button class="btn" onclick="pinSave()">Ändern</button></div></div>`;
+  out += `<div class="card"><h2>🌐 Google-Kalender (nur lesen)</h2>
+    <div class="hint" style="margin:-4px 0 10px">Gemeinsamen Familienkalender in Google anlegen, private iCal-Adresse hier eintragen – die App zeigt die Termine automatisch mit an. Einrichtung: siehe ANLEITUNG, Abschnitt Kalender.</div>
+    <div class="addform"><input id="gcal-url" placeholder="https://…/basic.ics bzw. Worker-URL" value="${esc(S.einstellungen.icsUrl || "")}">
+    <button class="btn" onclick="gcalUrlSpeichern()">Speichern</button></div>
+    ${gcal.am ? `<div class="hint">Zuletzt geladen: ${gcal.am.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })} Uhr · ${gcal.events.length} Termine (nächste 60 Tage)</div>` : ""}</div>`;
   out += `<div class="card"><h2>💾 Datensicherung</h2>
     <div class="hint" style="margin:-4px 0 10px">Alle Daten als Datei sichern – für den Fall der Fälle, unabhängig von Firebase.</div>
     <div style="display:flex;gap:8px">
@@ -996,6 +1346,29 @@ function renderKids() {
       <div class="bar"><i style="width:${pct}%"></i></div>
     </div>`;
 
+  // Taschengeld-Karte (nur wenn Betrag > 0)
+  const tg = tgVon(kidsKind);
+  if (tg && tg.betrag > 0) {
+    const key = tgKey();
+    const erhalten = (tg.erhalten || {})[key];
+    const offen = tgOffeneWochen(kidsKind);
+    const rueckstand = offen.filter(k => k !== key);
+    out += `<div class="starbank moneycard">
+      <div class="lbl">💰 Dein Taschengeld</div>
+      <div class="num" style="color:var(--pounamu)">${euro(tg.betrag)}</div>
+      <div class="lbl">jede Woche</div>`;
+    if (erhalten) {
+      out += `<div class="goal" style="margin-top:10px">✓ Für diese Woche bekommen!</div>
+        <div class="lbl">Neues Taschengeld gibt's ab Montag 🗓️</div>`;
+    } else {
+      out += `<button class="kmoney-btn" onclick="tgKidHaken('${kidsKind}', event)">💰 Ich hab's bekommen!</button>`;
+    }
+    if (rueckstand.length) {
+      out += `<div class="lbl" style="margin-top:10px">Mama & Papa haben noch <strong style="color:var(--gold)">${euro(rueckstand.length * tg.betrag)}</strong> für dich (${rueckstand.length} ${rueckstand.length === 1 ? "Woche" : "Wochen"}) 🐷</div>`;
+    }
+    out += `</div>`;
+  }
+
   const doneN = aufg.filter(x => (x.done || {})[h]).length;
   out += aufg.length ? `<div style="font-family:Sora;font-weight:700;font-size:16px;margin:4px 4px 10px;color:var(--pounamu-deep)">Deine Aufgaben heute <span style="color:var(--gold)">(${doneN} von ${aufg.length})</span>:</div>` : "";
   out += aufg.map(a => {
@@ -1015,6 +1388,65 @@ function renderKids() {
   out += `</div>`;
   k.innerHTML = out;
 }
+/* ---------- Taschengeld ---------- */
+function euro(n) { return (Math.round(n * 100) / 100).toFixed(2).replace(".", ",") + " €"; }
+function tgKey(d) { return dstr(wochenStart(d || new Date())); }
+function tgVon(kindId) { return (S.taschengeld || {})[kindId] || null; }
+function tgOffeneWochen(kindId) {
+  const tg = tgVon(kindId);
+  if (!tg || !(tg.betrag > 0)) return [];
+  const offene = [];
+  let d = new Date((tg.startWoche || tgKey()) + "T12:00:00");
+  const aktuell = tgKey();
+  for (let i = 0; i < 520 && dstr(d) <= aktuell; i++, d.setDate(d.getDate() + 7)) {
+    const key = dstr(d);
+    if (!(tg.erhalten || {})[key]) offene.push(key);
+  }
+  return offene;
+}
+function tgAusstehend(kindId) {
+  const tg = tgVon(kindId);
+  return tg && tg.betrag > 0 ? tgOffeneWochen(kindId).length * tg.betrag : 0;
+}
+function tgSetzen(kindId) {
+  const roh = $("tg-betrag-" + kindId).value.trim().replace(",", ".");
+  const betrag = Math.max(0, parseFloat(roh) || 0);
+  if (!S.taschengeld) S.taschengeld = {};
+  const tg = S.taschengeld[kindId] || {};
+  tg.betrag = betrag;
+  if (betrag > 0 && !tg.startWoche) tg.startWoche = tgKey();
+  if (!tg.erhalten) tg.erhalten = {};
+  S.taschengeld[kindId] = tg;
+  save("taschengeld");
+  toast(betrag > 0 ? euro(betrag) + " pro Woche für " + mName(kindId) : "Taschengeld für " + mName(kindId) + " pausiert");
+}
+function tgKidHaken(kindId, ev) {
+  const tg = tgVon(kindId); if (!tg || !(tg.betrag > 0)) return;
+  const key = tgKey();
+  if (!tg.erhalten) tg.erhalten = {};
+  if (tg.erhalten[key]) return;
+  tg.erhalten[key] = true;
+  save("taschengeld"); vib(40);
+  // Münzregen
+  const cx = ev && ev.clientX || window.innerWidth / 2, cy = ev && ev.clientY || 200;
+  for (let i = 0; i < 8; i++) {
+    const s = document.createElement("div"); s.className = "burst";
+    s.textContent = i % 2 ? "🪙" : "💰";
+    s.style.left = (cx - 50 + Math.random() * 100) + "px";
+    s.style.top = (cy - 10 + Math.random() * 30) + "px";
+    s.style.animationDelay = (i * 55) + "ms";
+    document.body.appendChild(s); setTimeout(() => s.remove(), 1400);
+  }
+  renderKids();
+}
+function tgAuszahlen(kindId) {
+  if (!confirm("Alle offenen Wochen für " + mName(kindId) + " als ausgezahlt markieren?")) return;
+  const tg = tgVon(kindId); if (!tg) return;
+  if (!tg.erhalten) tg.erhalten = {};
+  tgOffeneWochen(kindId).forEach(k => tg.erhalten[k] = true);
+  save("taschengeld"); toast("Ausgezahlt ✓");
+}
+
 const KIWI_SPRUECHE = [
   "Ka pai! – Gut gemacht!", "Kia kaha! – Du schaffst das!", "Tino pai! – Super!",
   "He rā ātaahua! – Was für ein schöner Tag!", "Ka rawe! – Großartig!", "Haere tonu! – Weiter so!"

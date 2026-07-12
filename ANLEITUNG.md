@@ -80,6 +80,71 @@ Datenbank-Regeln (Schritt 1.3) und den Login-Konten.
 `localhost` entfernen. Zusätzlich: Nutzer-Registrierung ist ohnehin nur
 über die Konsole möglich, da die App keine Registrierungsfunktion hat.
 
+
+---
+
+## Google-Kalender anbinden (nur lesen, ca. 15 Min.)
+
+Die App zeigt einen gemeinsamen Google-Kalender automatisch mit an.
+Eingetragen wird weiterhin in Google (Handy, PC, Sprachassistent) –
+Whānau liest mit.
+
+**Schritt 1 – Familienkalender anlegen:**
+Google Kalender (PC) → links neben „Weitere Kalender" auf ＋ →
+„Neuen Kalender einrichten" → Name „Familie" → Erstellen.
+Dann: Einstellungen des Kalenders → „Für bestimmte Personen freigeben"
+→ Jenny mit „Änderungen vornehmen" einladen. Ab jetzt tragt ihr
+Familientermine in diesen Kalender ein.
+
+**Schritt 2 – Private iCal-Adresse holen:**
+Einstellungen des Familienkalenders → ganz unten
+„Privatadresse im iCal-Format" → URL kopieren
+(endet auf `basic.ics`). ⚠️ Diese URL nicht öffentlich teilen –
+wer sie hat, kann die Termine lesen.
+
+**Schritt 3 – Mini-Proxy auf Cloudflare (wegen Browser-CORS):**
+Google erlaubt den Abruf nicht direkt aus dem Browser, deshalb ein
+10-Zeilen-Worker. dash.cloudflare.com → Workers & Pages →
+„Create Worker" → Code ersetzen durch:
+
+```js
+export default {
+  async fetch(req) {
+    const ziel = new URL(req.url).searchParams.get("url");
+    if (!ziel || !ziel.startsWith("https://calendar.google.com/")) {
+      return new Response("Nur Google-Kalender erlaubt", { status: 400 });
+    }
+    const r = await fetch(ziel, { cf: { cacheTtl: 300 } });
+    return new Response(await r.text(), {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "text/calendar; charset=utf-8"
+      }
+    });
+  }
+};
+```
+
+→ Deploy. Deine Worker-URL sieht dann so aus:
+`https://DEIN-WORKER.DEIN-NAME.workers.dev`
+
+**Schritt 4 – In der App eintragen:**
+Mehr → Familie & Einstellungen → „Google-Kalender" → dort diese
+kombinierte URL einfügen und speichern:
+
+```
+https://DEIN-WORKER.DEIN-NAME.workers.dev/?url=HIER-DIE-ICS-URL
+```
+
+(Die ICS-URL am besten vorher einmal durch einen URL-Encoder schicken
+oder direkt so einfügen – der Worker kommt mit beidem klar, solange
+keine &-Zeichen in der ICS-URL stecken; Googles Privatadressen haben keine.)
+
+Die App lädt die Termine bei jedem Start und per ↻-Knopf im
+Kalender-Tab (nächste 60 Tage, inkl. wöchentlicher Serien).
+Google-Termine tragen ein 🌐 und sind in der App bewusst nicht löschbar.
+
+
 ---
 
 ## Teil 3: Als App aufs Handy (2 Min. pro Gerät)
@@ -96,7 +161,10 @@ Browserleiste, App-Shell funktioniert auch offline (Daten-Sync braucht Internet)
 
 ## Teil 4: Erste Schritte in der App
 
-1. Anmelden mit deiner E-Mail/Passwort (Jenny mit ihrer).
+1. Anmelden mit deiner E-Mail/Passwort (Jenny mit ihrer) – „Angemeldet
+   bleiben" ist vorausgewählt, danach fragt die App nicht mehr.
+   Beim ersten Start wählt jeder einmal „Wer nutzt die App auf diesem
+   Gerät?" – damit stimmen Begrüßung und Zettel-Absender.
 2. **Mehr → Familie & Einstellungen:** Alle vier Mitglieder anlegen
    (Rolle „Erwachsen" bzw. „Kind"). Erst dann erscheinen Kinderbereich,
    Stundenplan und Zuständigkeiten.
@@ -109,16 +177,72 @@ Browserleiste, App-Shell funktioniert auch offline (Daten-Sync braucht Internet)
 
 ---
 
+## Kinder-Tablets: Amazon Fire im Kids-Bereich
+
+Die Kinder bleiben im Amazon-Kids-Profil – dafür gibt es zwei Wege.
+Die App ist darauf vorbereitet: Das Firebase-SDK wird von eurer eigenen
+GitHub-Seite mitgeliefert (nicht mehr von Google-Servern), damit die
+Freigabeliste kurz bleibt.
+
+### Weg A: Website im Kids-Profil freigeben (zuerst probieren)
+
+Amazon erlaubt Eltern, einzelne Websites für Kinderprofile freizugeben –
+sie erscheinen dann als Kachel beim Kind.
+
+1. **Vorbereitung auf dem Tablet (im Elternprofil):** App-URL öffnen,
+   anmelden, unter *Mehr → Familie → Dieses Gerät* das Kind auswählen
+   und den **Kiosk-Modus** auf „An" stellen. Die App startet ab jetzt
+   direkt im Kinderbereich; raus geht es nur mit eurer PIN.
+2. **Freigeben:** Eltern-Dashboard (parents.amazon.com oder auf dem
+   Tablet: Einstellungen → Kindersicherung → Kinderprofil →
+   *Inhalte hinzufügen → Web*) → folgende Adressen freigeben:
+   - `https://DEIN-NAME.github.io` (die App selbst, inkl. SDK)
+   - `https://identitytoolkit.googleapis.com` (Anmeldung)
+   - `https://securetoken.googleapis.com` (Sitzung verlängern)
+   - `https://DEIN-PROJEKT-default-rtdb.europe-west1.firebasedatabase.app` (Daten-Sync)
+   - optional `https://fonts.googleapis.com` und `https://fonts.gstatic.com`
+     (nur Schrift – ohne sie läuft die App mit Systemschrift weiter)
+3. Im Kids-Profil die Web-Kachel antippen → Kinderbereich öffnet sich.
+
+⚠️ Ehrlicher Hinweis: Wie streng Amazons Kids-Browser Hintergrund-
+Verbindungen filtert, ändert sich mit Updates und lässt sich nur am
+Gerät testen. Wenn die App lädt, aber „Keine Verbindung" zeigt, blockt
+der Browser die Sync-Domains – dann Weg B.
+
+### Weg B: Als App verpacken und ins Kinderprofil legen (robust)
+
+Ins Amazon-Kids-Profil lassen sich auch **selbst installierte Apps**
+aufnehmen – das umgeht den Web-Filter komplett:
+
+1. Auf **pwabuilder.com** die App-URL eingeben → *Package for Stores →
+   Android* → Paket herunterladen (APK).
+2. APK aufs Tablet (z. B. per USB oder Download-Link) und im
+   Elternprofil installieren (*Einstellungen → Sicherheit → Apps aus
+   unbekannten Quellen* für den Dateimanager erlauben).
+3. *Einstellungen → Kindersicherung → Kinderprofil → Inhalte
+   hinzufügen → Apps* → die Whānau-App fürs Kind freigeben.
+4. Die App erscheint mit Koru-Icon im Kids-Bereich; dank Kiosk-Modus
+   landet das Kind direkt bei seinen Aufgaben und Sternen.
+
+Hinweis zu Weg B: Das PWABuilder-Paket öffnet die Web-App auf
+Fire-Tablets über den Silk-Browser-Unterbau; einmal im Elternprofil
+anmelden und Kiosk aktivieren, danach läuft es fürs Kind.
+
+
+---
+
 ## Was die App kann (Überblick)
 
 | Bereich | Funktionen |
 |---|---|
 | **Heute** | Begrüßung, Termine, Essen, fällige To-dos & Routinen, Packliste für morgen, Zettel, Countdowns, Wochenbilanz |
-| **Termine** | Kalender (einmalig/wöchentlich), Stundenplan pro Kind, Ferienübersicht |
-| **Listen** | Einkaufsliste (Kategorien), To-dos mit Zuständigkeit, Routinen mit Wochen-Rotation, Packlisten je Wochentag |
-| **Essen** | Wochenplan, Familien-Kochbuch mit 40 Starter-Gerichten (Import-Button), smarte Vorschläge (lange nicht gekocht, werktags nur Schnelles, ab 3 Fleisch/Fisch-Tagen vegetarisch), Zutaten → Einkaufsliste per Klick |
+| **Termine** | Eigener Kalender (einmalig/wöchentlich, mehrere Teilnehmer), Google-Kalender-Anzeige (🌐, nur lesen), Stundenplan pro Kind, Ferienübersicht |
+| **Listen** | Einkaufsliste mit automatischer Themen-Sortierung in Supermarkt-Laufreihenfolge, To-dos mit Zuständigkeit, Routinen mit Wochen-Rotation, thematische Packlisten mit Vorlagen (Schwimmbad, Camping, Flugreise …) und Zurücksetzen-Funktion |
+| **Essen** | Wochenplan mit „Offene Tage füllen" und „Woche neu würfeln", Tag antippen → Rezept-Ansicht mit Zutaten & Zubereitungstipp, Familien-Kochbuch mit 40 Starter-Gerichten, smarte Vorschläge (lange nicht gekocht, werktags nur Schnelles, ab 3 Fleisch/Fisch-Tagen vegetarisch), Zutaten → Einkaufsliste per Klick |
 | **Kinderbereich** | Verspielter Vollbild-Modus, große Aufgabenkarten mit Stern-Animation, Sternekonto mit Fortschrittsbalken & Belohnungsziel, Countdowns; Ausgang PIN-geschützt |
-| **Mehr** | Zettelkasten, Countdowns, Wochenend-Ideen (Sonne/Regen), Geschenke-Merkliste, Gesundheits-Log, Notfall & Infos, Datensicherung (Export/Import als JSON) |
+| **Mehr** | Zettelkasten, Countdowns, Wochenend-Ideen (Sonne/Regen), Geschenke-Merkliste, Gesundheits-Log, Notfall & Infos mit Vorlage (Notruf, Ärzte, Kleider-/Schuhgrößen – antippen zum Ausfüllen), Datensicherung (Export/Import als JSON) |
+| **Taschengeld** | Wochen-Erinnerer: Kind hakt „Ich hab's bekommen!" ab (mit Münzregen), Reset zum Wochenstart; Betrag pro Kind im Elternbereich (0 € = ausgeblendet); verpasste Wochen summieren sich und erscheinen auf dem Eltern-Dashboard, per Knopf als ausgezahlt markierbar |
+| **Kinder-Tablets** | Kiosk-Modus pro Gerät (Start direkt im Kinderbereich, Ausgang nur per PIN), Firebase-SDK lokal ausgeliefert für Amazon-Kids-Freigabe |
 | **Automatisch** | Zeitbewusste Māori-Begrüßung (Mōrena/Kia ora), Geburtstags-Countdowns & -Banner, Ferien-Banner, Einkaufs-Schnellwahl aus euren häufigsten Artikeln, Offline-Anzeige, Update-Hinweis bei neuer Version, Dark Mode folgt der Systemeinstellung |
 
 ## Bekannte Grenzen

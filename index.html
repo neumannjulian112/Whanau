@@ -196,6 +196,11 @@ nav.tabs button.on{color:var(--pounamu)}
 .donesec{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)}
 .sheetinput{font-size:17px;padding:13px;margin:6px 0 14px}
 .pininput{font-family:Sora;font-size:30px;letter-spacing:.4em;text-align:center;padding:12px;margin:6px 0 14px}
+.moneycard{background:linear-gradient(160deg,#FFF9EC,#FDF3DC)}
+@media (prefers-color-scheme: dark){.moneycard{background:linear-gradient(160deg,#332A15,#2A2312)}}
+.kmoney-btn{display:block;width:100%;margin-top:12px;background:linear-gradient(120deg,var(--gold),#F2C464);
+  color:#4a3405;font-family:Sora;font-weight:700;font-size:18px;padding:16px;border-radius:18px;box-shadow:var(--shadow)}
+.kmoney-btn:active{transform:scale(.97)}
 .kiwi-spruch{text-align:center;font-size:14px;color:var(--pounamu-deep);margin:-4px 0 14px;font-weight:600}
 
 /* ---------- Dark Mode ---------- */
@@ -224,6 +229,9 @@ nav.tabs button.on{color:var(--pounamu)}
     <div id="loginform">
       <input type="email" id="lg-mail" placeholder="E-Mail" autocomplete="username">
       <input type="password" id="lg-pass" placeholder="Passwort" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted);margin:2px 0 12px;text-align:left">
+        <input type="checkbox" id="lg-merken" checked style="width:auto"> Angemeldet bleiben
+      </label>
       <button class="btn" style="width:100%" onclick="doLogin()">Anmelden</button>
       <div class="err" id="lg-err"></div>
     </div>
@@ -250,9 +258,9 @@ nav.tabs button.on{color:var(--pounamu)}
 <div id="offline">📡 Keine Verbindung – Änderungen werden gesichert, sobald ihr wieder online seid</div>
 <div id="update"><span>Neue Version verfügbar</span><button onclick="updateJetzt()">Aktualisieren</button></div>
 
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+<script src="firebase-app-compat.js"></script>
+<script src="firebase-auth-compat.js"></script>
+<script src="firebase-database-compat.js"></script>
 <script src="firebase-config.js"></script>
 <script src="app.js"></script>
 </body>
