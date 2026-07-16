@@ -1,5 +1,5 @@
 /* Whānau Service Worker – App-Shell offline verfügbar */
-const CACHE = "whanau-v8";
+const CACHE = "whanau-v9";
 const SHELL = ["./", "./index.html", "./app.js", "./firebase-config.js", "./manifest.json", "./icon-192.png", "./icon-512.png", "./firebase-app-compat.js", "./firebase-auth-compat.js", "./firebase-database-compat.js"];
 
 self.addEventListener("install", e => {

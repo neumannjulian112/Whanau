@@ -144,7 +144,12 @@ function doLogin() {
     .catch(e => { $("lg-err").textContent = "Anmeldung fehlgeschlagen – E-Mail/Passwort prüfen."; });
 }
 function doLogout() { if (confirm("Abmelden?")) { credLoeschen(); firebase.auth().signOut(); } }
-function save(...keys) { keys.forEach(k => db.ref("daten/" + k).set(S[k])); }
+function save(...keys) {
+  // Werte VOR dem Schreiben einfrieren: der value-Listener feuert bei lokalen
+  // Writes synchron und ersetzt S – sonst ginge der zweite Schlüssel verloren.
+  const werte = keys.map(k => S[k]);
+  keys.forEach((k, i) => db.ref("daten/" + k).set(werte[i]));
+}
 
 /* ---------- Navigation ---------- */
 const TABS = [
@@ -256,6 +261,11 @@ function ladeGcal(zeigeToast) {
     render();
   });
 }
+function einkaufstagSpeichern() {
+  if (!S.einstellungen) S.einstellungen = {};
+  S.einstellungen.einkaufstag = $("ek-tag").value;
+  save("einstellungen"); toast("Einkaufstag: " + $("ek-tag").value);
+}
 function gcalUrlSpeichern() {
   if (!S.einstellungen) S.einstellungen = {};
   S.einstellungen.icsUrl = $("gcal-url").value.trim();
@@ -350,10 +360,7 @@ function rHeute() {
   const ferienJetzt = S.termine.filter(t => t.kategorie === "ferien" && t.datum <= h && (t.bis || t.datum) >= h);
   ferienJetzt.forEach(f => { out += `<div class="banner gruen">🏖️ ${esc(f.titel)}</div>`; });
 
-  if (kinder().length)
-    out += `<button class="kidsentry" onclick="openKids()"><span class="em">🥝</span>
-      <span><span class="big">Kinderbereich</span><br><span class="s">Aufgaben &amp; Sterne für ${esc(kinder().map(k => k.name).join(" & "))}</span></span>
-      <span class="arrow">→</span></button>`;
+
 
   const cds = S.countdowns.filter(c => tageBis(c.datum) >= 0).map(c => ({ emoji: c.emoji || "🎉", tage: tageBis(c.datum), titel: c.titel }));
   S.mitglieder.forEach(mm => {
@@ -426,6 +433,11 @@ function rHeute() {
     out += `<div class="card"><h2>⚖️ Wochenbilanz</h2><div class="row" style="border:none;gap:14px">` +
       bilanz.map(b => `<span class="chip">${avatarHtml(b.e.id)}&nbsp;${esc(b.e.name)}: <strong>&nbsp;${b.n}</strong></span>`).join("") +
       `</div><div class="hint">Erledigte Aufgaben & Routinen seit Montag.</div></div>`;
+
+  if (kinder().length)
+    out += `<button class="kidsentry" onclick="openKids()"><span class="em">🥝</span>
+      <span><span class="big">Kinderbereich</span><br><span class="s">Aufgaben &amp; Sterne für ${esc(kinder().map(k => k.name).join(" & "))}</span></span>
+      <span class="arrow">→</span></button>`;
 
   return out;
 }
@@ -749,8 +761,15 @@ function rEssen() {
   let out = segHtml("essen", [["woche", "Wochenplan"], ["kochbuch", "📖 Kochbuch"]]);
   if (sub.essen === "kochbuch") return out + rKochbuch();
 
-  const start = wochenStart(new Date());
-  out += `<div class="card"><h2>🍽️ Essensplan · KW ${isoWoche(new Date())}</h2>
+  const start = essenWochenStart();
+  const kw = isoWoche(new Date(dstr(start) + "T12:00:00"));
+  const wochenLabel = essenWoche === 0 ? "Diese Woche" : essenWoche === 1 ? "Nächste Woche" : "KW " + kw;
+  out += `<div class="card"><h2>🍽️ Essensplan
+      <span class="cnt" style="display:flex;align-items:center;gap:4px">
+        <button class="btn small ghost" ${essenWoche <= 0 ? "disabled style='opacity:.35'" : ""} onclick="essenWoche--;render()">‹</button>
+        ${wochenLabel} · KW ${kw}
+        <button class="btn small ghost" onclick="essenWoche++;render()">›</button>
+      </span></h2>
     <div style="display:flex;gap:8px;margin-bottom:10px">
       <button class="btn ghost small" style="flex:1" onclick="wocheFuellen(false)">✨ Offene Tage füllen</button>
       <button class="btn ghost small" style="flex:1" onclick="wocheFuellen(true)">🎲 Woche neu würfeln</button>
@@ -765,7 +784,7 @@ function rEssen() {
       out += `<div class="row" style="padding:4px 0;border:none">
         <button class="grow" style="text-align:left" onclick="dishSheet('${dish.id}','${ds}')">
           <div class="t">${esc(dish.name)} <span style="color:var(--muted);font-weight:400">›</span></div>
-          <div class="s">${ART_ICON[dish.art] || ""} ${dish.zeit === "wochenende" ? "🕐" : "⚡"} · antippen für Rezept & Zutaten</div>
+          <div class="s">${ART_ICON[dish.art] || ""} ${dish.zeit === "wochenende" ? "🕐" : "⚡"}${dish.grill ? " 🔥" : ""}${dish.frisch ? " 🌿 frisch" : ""} · antippen für Rezept</div>
         </button>
         <button class="del" aria-label="Löschen" title="Eintrag entfernen" onclick="essenClear('${ds}')">✕</button></div>`;
     } else if (plan.text) {
@@ -781,14 +800,14 @@ function rEssen() {
     }
     out += `</div></div>`;
   }
-  out += `<div class="hint">Geplante Tage antippen → Rezept, Zutaten und 🛒-Übertrag.</div></div>`;
+  out += `<div class="hint">Einkaufstag ist ${einkaufstag()} (änderbar unter Mehr → Familie): 🌿 Frisches wird nur kurz danach vorgeschlagen. Sa = 🍕 Pizza, Fr = alle zwei Wochen 🔥 Grillvorschlag.</div></div>`;
 
-  // Smart-Vorschläge für offene Tage
+  // Smart-Vorschläge für offene Tage der angezeigten Woche
   const offeneTage = [];
   for (let i = 0; i < 7; i++) {
     const d = new Date(start); d.setDate(d.getDate() + i);
     const ds = dstr(d);
-    if (ds >= heute() && !(S.essensplan[ds] && (S.essensplan[ds].text || S.essensplan[ds].dishId))) offeneTage.push(ds);
+    if (!(S.essensplan[ds] && (S.essensplan[ds].text || S.essensplan[ds].dishId))) offeneTage.push(ds);
   }
   if (S.kochbuch.length >= 3 && offeneTage.length) {
     out += `<div class="card"><h2>💡 Vorschläge für offene Tage</h2>
@@ -838,7 +857,7 @@ const STARTER_KOCHBUCH = [
   { name: "Penne mit Tomaten-Sahne & verstecktem Gemüse", tipp: "Zucchini und Karotten fein reiben und in der Soße mitkochen – die Kinder merken nichts.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Penne", "Passierte Tomaten", "Sahne", "Zucchini", "Karotten", "Parmesan"] },
   { name: "Gnocchi-Pfanne mit Zucchini & Cherrytomaten", tipp: "Gnocchi direkt in der Pfanne goldbraun braten (nicht kochen!), Gemüse dazu, Mozzarella zum Schluss.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Gnocchi", "Zucchini", "Cherrytomaten", "Knoblauch", "Mozzarella", "Basilikum"] },
   { name: "Pizza selbst belegt", tipp: "Teig 1 Std gehen lassen; jeder belegt seine Hälfte selbst – Ofen auf Maximum, Pizza aufs heiße Blech.", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Mehl", "Hefe", "Passierte Tomaten", "Mozzarella", "Paprika", "Mais", "Schinken (optional)"] },
-  { name: "Tagliatelle mit Lachs & Spinat", tipp: "Lachs würfeln, kurz anbraten, rausnehmen. Spinat in Sahne zusammenfallen lassen, Lachs zurück, Zitrone drüber.", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Tagliatelle", "Lachsfilet", "Blattspinat", "Sahne", "Zitrone", "Knoblauch"] },
+  { name: "Tagliatelle mit Lachs & Spinat", frisch: true, tipp: "Lachs würfeln, kurz anbraten, rausnehmen. Spinat in Sahne zusammenfallen lassen, Lachs zurück, Zitrone drüber.", art: "fisch", zeit: "schnell", kueche: "ital", zutaten: ["Tagliatelle", "Lachsfilet", "Blattspinat", "Sahne", "Zitrone", "Knoblauch"] },
   { name: "Minestrone mit Parmesan", tipp: "Alles Gemüse klein würfeln, mit Tomaten und Brühe 20 Min köcheln, Nudeln die letzten 8 Min mitkochen.", art: "veggie", zeit: "schnell", kueche: "ital", zutaten: ["Suppennudeln", "Karotten", "Zucchini", "Sellerie", "Weiße Bohnen", "Gehackte Tomaten", "Parmesan"] },
   { name: "Zitronen-Hähnchen mit Reis", tipp: "Hähnchen in Streifen braten, mit Zitronensaft und Butter ablöschen – die Soße über den Reis.", art: "fleisch", zeit: "schnell", kueche: "ital", zutaten: ["Hähnchenbrust", "Reis", "Zitrone", "Butter", "Brokkoli"] },
   { name: "Ofengemüse mit Halloumi", tipp: "Alles in grobe Stücke, mit Öl mischen, 25 Min bei 200 °C – Halloumi die letzten 10 Min obendrauf.", art: "veggie", zeit: "wochenende", kueche: "ital", zutaten: ["Kartoffeln", "Paprika", "Zucchini", "Rote Zwiebeln", "Halloumi", "Kräuterquark"] },
@@ -863,7 +882,7 @@ const STARTER_KOCHBUCH = [
   { name: "Hähnchen-Teriyaki mit Reis & Brokkoli", tipp: "Hähnchen braten, Teriyakisoße einköcheln bis sie glänzt, Sesam drüber – Brokkoli nur bissfest dämpfen.", art: "fleisch", zeit: "schnell", kueche: "asia", zutaten: ["Hähnchenbrust", "Teriyakisoße", "Reis", "Brokkoli", "Sesam"] },
   { name: "Mildes Gemüse-Kokos-Curry", tipp: "Currypaste kurz anrösten, mit Kokosmilch ablöschen, Gemüse 15 Min mitköcheln – Schärfe kommt bei Bedarf am Tisch dazu.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Kokosmilch", "Currypaste mild", "Kartoffeln", "Karotten", "Zuckerschoten", "Reis"] },
   { name: "Bratnudeln mit Gemüse", tipp: "Nudeln kochen, abschrecken, dann mit Gemüsestreifen in heißer Pfanne braten – Sojasoße erst zum Schluss.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Paprika", "Karotten", "Zucchini", "Sojasoße", "Eier"] },
-  { name: "Lachs-Teriyaki mit Reis", tipp: "Lachs auf der Hautseite braten, Soße erst in der letzten Minute dazu, sonst brennt sie an.", art: "fisch", zeit: "schnell", kueche: "asia", zutaten: ["Lachsfilet", "Teriyakisoße", "Reis", "Gurke", "Sesam"] },
+  { name: "Lachs-Teriyaki mit Reis", frisch: true, tipp: "Lachs auf der Hautseite braten, Soße erst in der letzten Minute dazu, sonst brennt sie an.", art: "fisch", zeit: "schnell", kueche: "asia", zutaten: ["Lachsfilet", "Teriyakisoße", "Reis", "Gurke", "Sesam"] },
   { name: "Sommerrollen zum Selberrollen", tipp: "Alles in Streifen schneiden und Schüsseln auf den Tisch – jeder rollt selbst, Kinder lieben es.", art: "veggie", zeit: "wochenende", kueche: "asia", zutaten: ["Reispapier", "Reisnudeln", "Karotten", "Gurke", "Salat", "Minze", "Erdnusssoße"] },
   { name: "Mildes Butter Chicken", tipp: "Hähnchen in Joghurt marinieren (gern schon morgens), Soße aus Tomaten, Butter und Sahne sanft köcheln.", art: "fleisch", zeit: "wochenende", kueche: "asia", zutaten: ["Hähnchenbrust", "Passierte Tomaten", "Sahne", "Butter", "Garam Masala", "Reis", "Naan"] },
   { name: "Schnelle Nudelsuppe mit Ei & Mais", tipp: "Brühe aufkochen, Nudeln 4 Min, Mais dazu, Ei verquirlt einrühren – in 10 Minuten auf dem Tisch.", art: "veggie", zeit: "schnell", kueche: "asia", zutaten: ["Mie-Nudeln", "Gemüsebrühe", "Eier", "Mais", "Frühlingszwiebeln", "Sojasoße"] },
@@ -877,7 +896,18 @@ const STARTER_KOCHBUCH = [
   { name: "Hummus-Teller mit warmem Fladenbrot", tipp: "Kichererbsen mit Tahini, Zitrone und Eiswürfel cremig mixen – Gemüsesticks zum Dippen.", art: "veggie", zeit: "schnell", kueche: "orient", zutaten: ["Kichererbsen", "Tahini", "Zitrone", "Fladenbrot", "Karotten", "Gurke", "Paprika"] },
   // Schnelle Allrounder
   { name: "Hähnchen-Wraps mit Salat", tipp: "Hähnchen würzig braten, alles in Schüsseln auf den Tisch – Wrap-Buffet, jeder baut seinen eigenen.", art: "fleisch", zeit: "schnell", kueche: "orient", zutaten: ["Wraps", "Hähnchenbrust", "Salat", "Tomaten", "Mais", "Joghurt-Dressing"] },
-  { name: "Backofen-Fisch mit Zitronenkartoffeln", tipp: "Kartoffelscheiben 25 Min vorbacken, Fisch mit Zitrone obendrauf, weitere 15 Min – ein Blech, wenig Abwasch.", art: "fisch", zeit: "wochenende", kueche: "ital", zutaten: ["Weißfischfilet", "Kartoffeln", "Zitrone", "Cherrytomaten", "Oliven (optional)"] }
+  { name: "Backofen-Fisch mit Zitronenkartoffeln", frisch: true, tipp: "Kartoffelscheiben 25 Min vorbacken, Fisch mit Zitrone obendrauf, weitere 15 Min – ein Blech, wenig Abwasch.", art: "fisch", zeit: "wochenende", kueche: "ital", zutaten: ["Weißfischfilet", "Kartoffeln", "Zitrone", "Cherrytomaten", "Oliven (optional)"] },
+  // Grillgerichte (für Freitage) & weitere Familienklassiker
+  { name: "Grillabend: Würstchen & Folienkartoffeln", art: "fleisch", zeit: "schnell", kueche: "deutsch", grill: true, tipp: "Kartoffeln in Folie zuerst auf den Grill (40 Min Randzone), Würstchen zum Schluss – Kräuterquark dazu.", zutaten: ["Bratwürste", "Große Kartoffeln", "Kräuterquark", "Salatgurke", "Ketchup & Senf"] },
+  { name: "Grillteller mit Halloumi & Gemüsespießen", art: "veggie", zeit: "schnell", kueche: "orient", grill: true, tipp: "Gemüse und Halloumi abwechselnd aufspießen, mit Öl bepinseln – Halloumi wird auf dem Grill goldbraun statt zu schmelzen.", zutaten: ["Halloumi", "Paprika", "Zucchini", "Champignons", "Ciabatta", "Tzatziki"] },
+  { name: "Gegrillte Hähnchenspieße mit Fladenbrot", art: "fleisch", zeit: "schnell", kueche: "orient", grill: true, tipp: "Hähnchen schon morgens in Joghurt und Paprikapulver marinieren – bleibt auf dem Grill saftig.", zutaten: ["Hähnchenbrust", "Joghurt", "Paprikapulver", "Fladenbrot", "Tomaten", "Gurke"] },
+  { name: "Ofen-Frittata mit Kartoffeln & Gemüse", art: "veggie", zeit: "schnell", kueche: "ital", tipp: "Reste-Retter: gekochte Kartoffeln und Gemüse in eine Form, verquirlte Eier mit Käse drüber, 20 Min bei 180 °C.", zutaten: ["Eier", "Kartoffeln (gekocht)", "Paprika", "Zucchini", "Käse gerieben", "Milch"] },
+  { name: "Spinat-Ricotta-Cannelloni", art: "veggie", zeit: "wochenende", kueche: "ital", tipp: "Füllung mit Spritzbeutel oder Gefrierbeutel (Ecke abschneiden) einfüllen – geht doppelt so schnell.", zutaten: ["Cannelloni", "Ricotta", "Blattspinat", "Passierte Tomaten", "Mozzarella", "Parmesan"] },
+  { name: "Kürbissuppe mit Brot", art: "veggie", zeit: "schnell", kueche: "deutsch", tipp: "Hokkaido muss nicht geschält werden – würfeln, weich kochen, mit Kokosmilch pürieren.", zutaten: ["Hokkaido-Kürbis", "Kartoffeln", "Kokosmilch", "Gemüsebrühe", "Brot", "Kürbiskerne"] },
+  { name: "Zürcher Geschnetzeltes mit Reis", art: "fleisch", zeit: "schnell", kueche: "deutsch", frisch: true, tipp: "Fleisch portionsweise scharf anbraten und rausnehmen – erst die Sahnesoße binden, dann zurückgeben.", zutaten: ["Schweinefilet", "Champignons", "Sahne", "Zwiebel", "Reis", "Petersilie"] },
+  { name: "Fischstäbchen-Burger", art: "fisch", zeit: "schnell", kueche: "deutsch", tipp: "Fischstäbchen extra knusprig backen, mit Remoulade und Salat ins Brötchen – Kinderhit mit Tiefkühl-Basis.", zutaten: ["Fischstäbchen", "Burgerbrötchen", "Remoulade", "Salat", "Tomaten", "Gurke"] },
+  { name: "Garnelen-Pasta mit Zitrone", art: "fisch", zeit: "schnell", kueche: "ital", frisch: true, tipp: "Garnelen nur 2–3 Minuten braten, sonst werden sie gummiartig – Zitronenabrieb erst am Ende.", zutaten: ["Spaghetti", "Garnelen", "Knoblauch", "Zitrone", "Cherrytomaten", "Petersilie"] },
+  { name: "Gemüse-Quesadillas", art: "veggie", zeit: "schnell", kueche: "orient", tipp: "Wraps mit Käse und Gemüse belegen, zuklappen, in der trockenen Pfanne beidseitig knusprig braten, in Ecken schneiden.", zutaten: ["Wraps", "Käse gerieben", "Paprika", "Mais", "Frühlingszwiebeln", "Joghurt-Dip"] }
 ];
 const ART_ICON = { veggie: "🥦", fleisch: "🍗", fisch: "🐟" };
 const KUECHE_LBL = { ital: "Mediterran", deutsch: "Klassisch", asia: "Asiatisch", orient: "Levante" };
@@ -908,11 +938,19 @@ function fleischTageInWoche(startDs) {
   return n;
 }
 let vorschlagOffset = {};
+function einkaufstag() { return (S.einstellungen && S.einstellungen.einkaufstag) || "Di"; }
+function tageSeitEinkauf(ds) {
+  const tagIdx = WD.indexOf(wtag(ds)), ekIdx = WD.indexOf(einkaufstag());
+  return (tagIdx - ekIdx + 7) % 7;
+}
 function vorschlagFuer(ds) {
   const w = wtag(ds), istWE = (w === "Sa" || w === "So");
   const startDs = dstr(wochenStart(new Date(ds + "T12:00:00")));
   const vielFleisch = fleischTageInWoche(startDs) >= 3;
   let kand = S.kochbuch.filter(k => istWE || (k.zeit || "schnell") === "schnell");
+  // Frische-Regel: Gerichte mit sehr frischen Zutaten nur bis 2 Tage nach dem Einkaufstag
+  const frischOk = tageSeitEinkauf(ds) <= 2;
+  if (!frischOk) { const halt = kand.filter(k => !k.frisch); if (halt.length) kand = halt; }
   if (vielFleisch) { const veg = kand.filter(k => k.art === "veggie"); if (veg.length) kand = veg; }
   if (!kand.length) kand = S.kochbuch.slice();
   // Bereits diese Woche geplante ausschließen
@@ -920,22 +958,32 @@ function vorschlagFuer(ds) {
   for (let i = 0; i < 7; i++) { const d = new Date(startDs + "T12:00:00"); d.setDate(d.getDate() + i); const p = S.essensplan[dstr(d)]; if (p && p.dishId) geplant.add(p.dishId); }
   const frei = kand.filter(k => !geplant.has(k.id)); if (frei.length) kand = frei;
   kand.sort((a, b) => letztesMal(a.id) < letztesMal(b.id) ? -1 : 1); // am längsten her zuerst
+  // Wochentags-Traditionen: Samstag = Pizza, Freitag in geraden Wochen = Grillen
+  if (w === "Sa") {
+    const pizza = S.kochbuch.find(k => /pizza/i.test(k.name));
+    if (pizza) kand = [pizza, ...kand.filter(k => k.id !== pizza.id)];
+  } else if (w === "Fr" && isoWoche(new Date(ds + "T12:00:00")) % 2 === 0) {
+    const grill = kand.filter(k => k.grill), rest = kand.filter(k => !k.grill);
+    if (grill.length) kand = [...grill, ...rest];
+  }
   if (!kand.length) return null;
   return kand[(vorschlagOffset[ds] || 0) % kand.length];
 }
 function vorschlagWeiter(ds) { vorschlagOffset[ds] = (vorschlagOffset[ds] || 0) + 1; render(); }
 function vorschlagNehmen(ds, dishId) { S.essensplan[ds] = { dishId }; save("essensplan"); toast("Übernommen"); }
+let essenWoche = 0; // 0 = aktuelle Woche, 1 = nächste Woche …
+function essenWochenStart() {
+  const s = wochenStart(new Date()); s.setDate(s.getDate() + essenWoche * 7); return s;
+}
 function wocheFuellen(alles) {
-  const start = wochenStart(new Date());
+  const start = essenWochenStart();
   let n = 0;
   for (let i = 0; i < 7; i++) {
     const d = new Date(start); d.setDate(d.getDate() + i);
     const ds = dstr(d);
-    if (ds < heute()) continue;
     const belegt = S.essensplan[ds] && (S.essensplan[ds].text || S.essensplan[ds].dishId);
     if (belegt && !alles) continue;
-    if (alles) vorschlagOffset[ds] = (vorschlagOffset[ds] || 0) + (belegt ? 1 : 0);
-    if (alles && belegt) delete S.essensplan[ds]; // neu würfeln: Platz freimachen für die Balance-Logik
+    if (alles && belegt) { vorschlagOffset[ds] = (vorschlagOffset[ds] || 0) + 1; delete S.essensplan[ds]; }
     const v = vorschlagFuer(ds);
     if (v) { S.essensplan[ds] = { dishId: v.id }; n++; }
   }
@@ -1256,6 +1304,10 @@ function rFamilie() {
     <div class="hint" style="margin:-4px 0 8px">Schützt den Ausgang aus dem Kinderbereich. Standard: 2468</div>
     <div class="addform"><input id="pin-neu" type="number" placeholder="Neue 4-stellige PIN">
     <button class="btn" onclick="pinSave()">Ändern</button></div></div>`;
+  out += `<div class="card"><h2>🛒 Einkaufstag</h2>
+    <div class="hint" style="margin:-4px 0 10px">Steuert die Essens-Vorschläge: Gerichte mit sehr frischen Zutaten (🌿) kommen nur bis zwei Tage nach dem Einkauf.</div>
+    <div class="addform"><select id="ek-tag">${["Mo","Di","Mi","Do","Fr","Sa","So"].map(t => `<option ${einkaufstag() === t ? "selected" : ""}>${t}</option>`).join("")}</select>
+    <button class="btn" onclick="einkaufstagSpeichern()">Speichern</button></div></div>`;
   out += `<div class="card"><h2>🌐 Google-Kalender (nur lesen)</h2>
     <div class="hint" style="margin:-4px 0 10px">Gemeinsamen Familienkalender in Google anlegen, private iCal-Adresse hier eintragen – die App zeigt die Termine automatisch mit an. Einrichtung: siehe ANLEITUNG, Abschnitt Kalender.</div>
     <div class="addform"><input id="gcal-url" placeholder="https://…/basic.ics bzw. Worker-URL" value="${esc(S.einstellungen.icsUrl || "")}">
