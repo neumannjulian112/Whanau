@@ -111,20 +111,31 @@ function starte() {
         }
         if (!window.__kioskGestartet && kioskAktiv() && kinder().length) {
           window.__kioskGestartet = true;
+          const vonUrl = urlKindId() && mitglied(urlKindId()) && mitglied(urlKindId()).rolle === "kind" ? urlKindId() : null;
           const ich = mitglied(ichId());
-          kidsKind = (ich && ich.rolle === "kind") ? ich.id : (kinder().length === 1 ? kinder()[0].id : null);
+          kidsKind = vonUrl || ((ich && ich.rolle === "kind") ? ich.id : (kinder().length === 1 ? kinder()[0].id : null));
           $("kids").classList.add("open"); renderKids();
         } else if (!window.__ichGefragt && S.mitglieder.length && !mitglied(ichId())) {
           window.__ichGefragt = true; ichFragen();
         }
       });
     } else {
-      // Auto-Login mit gemerkten Zugangsdaten (einmaliger Versuch)
-      const cred = gespeicherteCred();
+      // 1. Login-Token aus der Kind-URL (Tablet meldet sich ohne Tastatur an)
+      const tok = urlLoginToken();
+      const tokCred = tok ? tokenLesen(tok) : null;
+      // 2. sonst gemerkte Zugangsdaten
+      const cred = tokCred || gespeicherteCred();
       if (cred && !window.__autoLoginVersucht) {
         window.__autoLoginVersucht = true;
         firebase.auth().signInWithEmailAndPassword(cred.m, cred.p)
-          .catch(() => { credLoeschen(); $("login").classList.add("open"); });
+          .then(() => {
+            if (tokCred) {
+              credMerken(tokCred.m, tokCred.p);
+              // login-Token aus der sichtbaren Adresse entfernen, kind-Parameter behalten
+              try { const k = urlKindId(); history.replaceState(null, "", location.pathname + (k ? "#kind=" + k : "")); } catch (e) {}
+            }
+          })
+          .catch(() => { if (!tokCred) credLoeschen(); $("login").classList.add("open"); });
       } else {
         $("login").classList.add("open");
       }
@@ -304,8 +315,56 @@ function ichName() {
   if (m) return m.name;
   return meinName ? meinName.charAt(0).toUpperCase() + meinName.slice(1) : "";
 }
+function urlParams() {
+  // Parameter stehen im Hash (#kind=…&login=…), damit sie nicht an Server gesendet werden
+  const roh = (location.hash || "").replace(/^#/, "");
+  return new URLSearchParams(roh || location.search.replace(/^\?/, ""));
+}
+function urlKindId() { try { return urlParams().get("kind"); } catch (e) { return null; } }
+function urlLoginToken() { try { return urlParams().get("login"); } catch (e) { return null; } }
 function kioskAktiv() {
-  try { return localStorage.getItem("whanau-kiosk") === "1" || new URLSearchParams(location.search).get("kiosk") === "1"; } catch (e) { return false; }
+  try { return localStorage.getItem("whanau-kiosk") === "1" || urlParams().get("kiosk") === "1" || !!urlKindId(); } catch (e) { return false; }
+}
+function tokenBauen(mail, pass) {
+  // Einfacher Base64-Token für die Kind-URL (nur Familienintern, siehe Sicherheitshinweis in der Anleitung)
+  try { return encodeURIComponent(btoa(JSON.stringify({ m: mail, p: pass }))); } catch (e) { return ""; }
+}
+function tokenLesen(tok) {
+  try { return JSON.parse(atob(decodeURIComponent(tok))); } catch (e) { return null; }
+}
+function kindUrlBasis() {
+  return location.origin + location.pathname;
+}
+function kindUrlSheet(kindId) {
+  const k = mitglied(kindId); if (!k) return;
+  const cred = gespeicherteCred();
+  const basis = kindUrlBasis();
+  const mitToken = cred ? `${basis}#kind=${kindId}&login=${tokenBauen(cred.m, cred.p)}` : "";
+  const ohneToken = `${basis}#kind=${kindId}`;
+  $("sheet").innerHTML = `<h3>🔗 Tablet-Link für ${esc(k.name)}</h3>
+    <div class="hint" style="margin:-6px 0 12px">Diese Adresse auf ${esc(k.name)}s Fire-Tablet freigeben und als Lesezeichen speichern. Sie öffnet die App direkt in ${esc(k.name)}s Bereich – der Elternbereich ist nur mit PIN erreichbar.</div>`;
+  if (mitToken) {
+    $("sheet").innerHTML += `<div class="hint" style="font-weight:600;margin-bottom:4px">Link mit automatischer Anmeldung (empfohlen fürs Tablet):</div>
+      <textarea id="kurl-token" readonly style="min-height:96px;font-size:12px;word-break:break-all">${esc(mitToken)}</textarea>
+      <button class="btn" style="width:100%;margin:8px 0 16px" onclick="kindUrlKopieren('kurl-token')">📋 Kopieren</button>
+      <div class="hint" style="color:var(--coral);margin-bottom:16px">⚠️ Dieser Link enthält euer Login – nur auf den Familien-Tablets speichern, nicht weitergeben.</div>`;
+  } else {
+    $("sheet").innerHTML += `<div class="banner" style="margin-bottom:12px">Damit der Link die automatische Anmeldung mitbringt, meldet euch einmal mit gesetztem Haken „Angemeldet bleiben" an – dann diesen Dialog erneut öffnen.</div>`;
+  }
+  $("sheet").innerHTML += `<div class="hint" style="font-weight:600;margin-bottom:4px">Link ohne Anmeldung (Tablet fragt einmalig Passwort):</div>
+    <textarea id="kurl-plain" readonly style="min-height:60px;font-size:12px;word-break:break-all">${esc(ohneToken)}</textarea>
+    <button class="btn ghost" style="width:100%;margin:8px 0 4px" onclick="kindUrlKopieren('kurl-plain')">📋 Kopieren</button>
+    <button class="btn ghost" style="width:100%;margin-top:12px" onclick="sheetClose()">Schließen</button>`;
+  $("modal").classList.add("open");
+}
+function kindUrlKopieren(id) {
+  const el = $(id); if (!el) return;
+  el.select(); el.setSelectionRange(0, 99999);
+  const fertig = () => toast("Link kopiert – jetzt auf dem Tablet freigeben");
+  try {
+    if (navigator.clipboard) navigator.clipboard.writeText(el.value).then(fertig, () => { document.execCommand("copy"); fertig(); });
+    else { document.execCommand("copy"); fertig(); }
+  } catch (e) { document.execCommand("copy"); fertig(); }
 }
 function kioskSetzen(an) {
   try { an ? localStorage.setItem("whanau-kiosk", "1") : localStorage.removeItem("whanau-kiosk"); } catch (e) {}
@@ -1286,6 +1345,7 @@ function rFamilie() {
   let out = `<div class="card"><h2>👨‍👩‍👧‍👧 Familienmitglieder</h2>`;
   out += S.mitglieder.map(m => `<div class="row">${avatarHtml(m.id)}
     <div class="grow"><div class="t">${esc(m.name)}</div><div class="s">${m.rolle === "kind" ? "Kind" : "Erwachsen"}${m.geb ? " · 🎂 " + fmt(m.geb).slice(4) : ""}</div></div>
+    ${m.rolle === "kind" ? `<button class="btn small ghost" title="Tablet-Link" onclick="kindUrlSheet('${m.id}')">🔗 Link</button>` : ""}
     <button class="del" aria-label="Löschen" onclick="mitgliedDel('${m.id}')">✕</button></div>`).join("") || `<div class="empty">Legt euch alle vier an – dann füllt sich die App mit Leben.</div>`;
   out += `<div class="formgrid"><input id="mg-name" placeholder="Name">
     <select id="mg-rolle"><option value="erwachsen">Erwachsen</option><option value="kind">Kind</option></select>

@@ -209,6 +209,34 @@ Verbindungen filtert, ändert sich mit Updates und lässt sich nur am
 Gerät testen. Wenn die App lädt, aber „Keine Verbindung" zeigt, blockt
 der Browser die Sync-Domains – dann Weg B.
 
+### Kind-Direktlinks (empfohlen für den Kids-Bereich)
+
+Statt euch auf jedem Tablet anzumelden und den Kiosk-Schalter zu setzen,
+erzeugt die App **pro Kind eine eigene Adresse**, die direkt und nur in
+dessen Bereich führt:
+
+1. Auf deinem Handy einmal mit Haken **„Angemeldet bleiben"** einloggen.
+2. *Mehr → Familie & Einstellungen* → beim Kind auf **„🔗 Link"** tippen.
+3. Es erscheinen zwei Links:
+   - **Link mit automatischer Anmeldung** (empfohlen): Das Tablet meldet
+     sich ohne Tastatureingabe an und öffnet direkt Mias bzw. Lenas Seite.
+     Enthält einen Login-Schlüssel – daher nur auf den Familien-Tablets
+     speichern, nicht weitergeben.
+   - **Link ohne Anmeldung**: fragt auf dem Tablet einmalig das Passwort
+     ab (falls du den Schlüssel nicht in der Adresse haben möchtest).
+4. Link kopieren, im Amazon-Eltern-Dashboard für das jeweilige Kinderprofil
+   als erlaubte Website freigeben (wie zuvor beschrieben) und im Kids-Silk
+   als Lesezeichen/Startseite ablegen.
+
+Der Ausgang aus dem Kinderbereich bleibt weiterhin nur mit der Eltern-PIN
+möglich. Nach dem ersten Laden verschwindet der Login-Schlüssel aus der
+sichtbaren Adresszeile (er bleibt im gespeicherten Lesezeichen erhalten).
+
+Sicherheitshinweis: Der Direktlink ist eine bewusste Bequemlichkeits-
+Abwägung für ein Gerät, das ohnehin in Kinderhand ist. Wer das Login
+nicht in einem Lesezeichen hinterlegen möchte, nutzt den Link ohne
+Anmeldung oder Weg B.
+
 ### Weg B: Als App verpacken und ins Kinderprofil legen (robust)
 
 Ins Amazon-Kids-Profil lassen sich auch **selbst installierte Apps**
@@ -242,7 +270,7 @@ anmelden und Kiosk aktivieren, danach läuft es fürs Kind.
 | **Kinderbereich** | Verspielter Vollbild-Modus, große Aufgabenkarten mit Stern-Animation, Sternekonto mit Fortschrittsbalken & Belohnungsziel, Countdowns; Ausgang PIN-geschützt |
 | **Mehr** | Zettelkasten, Countdowns, Wochenend-Ideen (Sonne/Regen), Geschenke-Merkliste, Gesundheits-Log, Notfall & Infos mit Vorlage (Notruf, Ärzte, Kleider-/Schuhgrößen – antippen zum Ausfüllen), Datensicherung (Export/Import als JSON) |
 | **Taschengeld** | Wochen-Erinnerer: Kind hakt „Ich hab's bekommen!" ab (mit Münzregen), Reset zum Wochenstart; Betrag pro Kind im Elternbereich (0 € = ausgeblendet); verpasste Wochen summieren sich und erscheinen auf dem Eltern-Dashboard, per Knopf als ausgezahlt markierbar |
-| **Kinder-Tablets** | Kiosk-Modus pro Gerät (Start direkt im Kinderbereich, Ausgang nur per PIN), Firebase-SDK lokal ausgeliefert für Amazon-Kids-Freigabe |
+| **Kinder-Tablets** | Kind-Direktlinks (eine Adresse pro Kind, öffnet nur dessen Bereich, optional mit automatischer Anmeldung ohne Tastatur), Kiosk-Modus pro Gerät, Ausgang nur per PIN, Firebase-SDK lokal ausgeliefert für Amazon-Kids-Freigabe |
 | **Automatisch** | Zeitbewusste Māori-Begrüßung (Mōrena/Kia ora), Geburtstags-Countdowns & -Banner, Ferien-Banner, Einkaufs-Schnellwahl aus euren häufigsten Artikeln, Offline-Anzeige, Update-Hinweis bei neuer Version, Dark Mode folgt der Systemeinstellung |
 
 ## Bekannte Grenzen
