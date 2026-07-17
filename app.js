@@ -132,7 +132,7 @@ function starte() {
             if (tokCred) {
               credMerken(tokCred.m, tokCred.p);
               // login-Token aus der sichtbaren Adresse entfernen, kind-Parameter behalten
-              try { const k = urlKindId(); history.replaceState(null, "", location.pathname + (k ? "#kind=" + k : "")); } catch (e) {}
+              try { const k = urlKindId(); history.replaceState(null, "", location.pathname + (k ? "?kind=" + k : "")); } catch (e) {}
             }
           })
           .catch(() => { if (!tokCred) credLoeschen(); $("login").classList.add("open"); });
@@ -316,9 +316,13 @@ function ichName() {
   return meinName ? meinName.charAt(0).toUpperCase() + meinName.slice(1) : "";
 }
 function urlParams() {
-  // Parameter stehen im Hash (#kind=…&login=…), damit sie nicht an Server gesendet werden
-  const roh = (location.hash || "").replace(/^#/, "");
-  return new URLSearchParams(roh || location.search.replace(/^\?/, ""));
+  // Query (?kind=…) zuerst – Amazon-Kids-Filter verarbeitet das zuverlässig;
+  // Hash (#kind=…) zusätzlich als Rückfall (ältere Links, andere Browser).
+  const query = new URLSearchParams(location.search.replace(/^\?/, ""));
+  const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  return {
+    get(k) { return query.get(k) != null ? query.get(k) : hash.get(k); }
+  };
 }
 function urlKindId() { try { return urlParams().get("kind"); } catch (e) { return null; } }
 function urlLoginToken() { try { return urlParams().get("login"); } catch (e) { return null; } }
@@ -339,10 +343,11 @@ function kindUrlSheet(kindId) {
   const k = mitglied(kindId); if (!k) return;
   const cred = gespeicherteCred();
   const basis = kindUrlBasis();
-  const mitToken = cred ? `${basis}#kind=${kindId}&login=${tokenBauen(cred.m, cred.p)}` : "";
-  const ohneToken = `${basis}#kind=${kindId}`;
+  const mitToken = cred ? `${basis}?kind=${kindId}&login=${tokenBauen(cred.m, cred.p)}` : "";
+  const ohneToken = `${basis}?kind=${kindId}`;
   $("sheet").innerHTML = `<h3>🔗 Tablet-Link für ${esc(k.name)}</h3>
-    <div class="hint" style="margin:-6px 0 12px">Diese Adresse auf ${esc(k.name)}s Fire-Tablet freigeben und als Lesezeichen speichern. Sie öffnet die App direkt in ${esc(k.name)}s Bereich – der Elternbereich ist nur mit PIN erreichbar.</div>`;
+    <div class="hint" style="margin:-6px 0 10px">Öffnet die App direkt in ${esc(k.name)}s Bereich (Elternbereich nur mit PIN).</div>
+    <div class="banner gruen" style="margin-bottom:12px">📋 Wichtig für Amazon Fire: Gib im Kids-Dashboard nur deine <strong>Haupt-App-Adresse</strong> frei (${esc(kindUrlBasis())}) – <strong>ohne</strong> den Teil ab dem Fragezeichen. Amazon erlaubt dann alle Unterseiten, auch diesen Link.</div>`;
   if (mitToken) {
     $("sheet").innerHTML += `<div class="hint" style="font-weight:600;margin-bottom:4px">Link mit automatischer Anmeldung (empfohlen fürs Tablet):</div>
       <textarea id="kurl-token" readonly style="min-height:96px;font-size:12px;word-break:break-all">${esc(mitToken)}</textarea>
@@ -354,8 +359,23 @@ function kindUrlSheet(kindId) {
   $("sheet").innerHTML += `<div class="hint" style="font-weight:600;margin-bottom:4px">Link ohne Anmeldung (Tablet fragt einmalig Passwort):</div>
     <textarea id="kurl-plain" readonly style="min-height:60px;font-size:12px;word-break:break-all">${esc(ohneToken)}</textarea>
     <button class="btn ghost" style="width:100%;margin:8px 0 4px" onclick="kindUrlKopieren('kurl-plain')">📋 Kopieren</button>
+    <div id="kurl-qr" style="text-align:center;margin-top:14px"></div>
     <button class="btn ghost" style="width:100%;margin-top:12px" onclick="sheetClose()">Schließen</button>`;
   $("modal").classList.add("open");
+  // QR-Code des empfohlenen Links rendern (falls Bibliothek geladen)
+  const zielUrl = mitToken || ohneToken;
+  setTimeout(() => qrRendern("kurl-qr", zielUrl, k.name), 60);
+}
+function qrRendern(containerId, text, name) {
+  const el = $(containerId); if (!el) return;
+  if (typeof QRCode === "undefined") {
+    el.innerHTML = `<div class="hint">QR-Code-Anzeige nicht verfügbar – bitte Link kopieren.</div>`;
+    return;
+  }
+  try {
+    el.innerHTML = `<div class="hint" style="margin-bottom:6px">Oder mit ${esc(name)}s Tablet-Kamera scannen:</div><div id="${containerId}-box" style="display:inline-block;background:#fff;padding:10px;border-radius:12px"></div>`;
+    new QRCode(document.getElementById(containerId + "-box"), { text, width: 180, height: 180, correctLevel: QRCode.CorrectLevel.M });
+  } catch (e) { el.innerHTML = `<div class="hint">QR-Code fehlgeschlagen – bitte Link kopieren.</div>`; }
 }
 function kindUrlKopieren(id) {
   const el = $(id); if (!el) return;

@@ -224,13 +224,24 @@ dessen Bereich führt:
      speichern, nicht weitergeben.
    - **Link ohne Anmeldung**: fragt auf dem Tablet einmalig das Passwort
      ab (falls du den Schlüssel nicht in der Adresse haben möchtest).
-4. Link kopieren, im Amazon-Eltern-Dashboard für das jeweilige Kinderprofil
-   als erlaubte Website freigeben (wie zuvor beschrieben) und im Kids-Silk
-   als Lesezeichen/Startseite ablegen.
+4. **Freigabe im Amazon-Dashboard (wichtig!):** Gib dort **nur deine
+   Haupt-App-Adresse** frei – also `https://DEIN-NAME.github.io/whanau/`
+   **ohne** den Teil ab dem `?`. Amazon erlaubt dann automatisch alle
+   Unterseiten derselben Adresse, auch den Kinderlink. Gibst du die
+   komplette Adresse mit `?kind=…` frei, kann der exakte Abgleich den
+   Link blockieren (dann öffnet sich nichts).
+5. Den vollständigen Kinderlink im Kids-Silk als Lesezeichen/Startseite
+   ablegen – oder den angezeigten **QR-Code** mit der Tablet-Kamera
+   scannen, dann musst du nichts tippen.
 
 Der Ausgang aus dem Kinderbereich bleibt weiterhin nur mit der Eltern-PIN
 möglich. Nach dem ersten Laden verschwindet der Login-Schlüssel aus der
 sichtbaren Adresszeile (er bleibt im gespeicherten Lesezeichen erhalten).
+
+Technischer Hinweis: Die Kinderlinks verwenden ein Fragezeichen
+(`?kind=…`) statt eines Rautezeichens (`#`), weil Amazons Kids-Browser
+Adressen mit `#` teils nicht sauber verarbeitet. Ältere Links mit `#`
+funktionieren weiterhin.
 
 Sicherheitshinweis: Der Direktlink ist eine bewusste Bequemlichkeits-
 Abwägung für ein Gerät, das ohnehin in Kinderhand ist. Wer das Login

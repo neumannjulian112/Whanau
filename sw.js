@@ -1,6 +1,6 @@
 /* Whānau Service Worker – App-Shell offline verfügbar */
-const CACHE = "whanau-v10";
-const SHELL = ["./", "./index.html", "./app.js", "./firebase-config.js", "./manifest.json", "./icon-192.png", "./icon-512.png", "./firebase-app-compat.js", "./firebase-auth-compat.js", "./firebase-database-compat.js"];
+const CACHE = "whanau-v11";
+const SHELL = ["./", "./index.html", "./app.js", "./firebase-config.js", "./manifest.json", "./icon-192.png", "./icon-512.png", "./firebase-app-compat.js", "./firebase-auth-compat.js", "./firebase-database-compat.js", "./qrcode.min.js"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
